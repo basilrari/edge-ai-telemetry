@@ -6,3 +6,5 @@ description = "Minimal MAVLink telemetry reader for Pixhawk over serial"
 
 [dependencies]
 mavlink = { version = "0.17", features = ["ardupilotmega", "direct-serial"] }
+ratatui = { version = "0.29", features = ["crossterm"] }
+crossterm = { version = "0.28", features = ["event-stream"] }
