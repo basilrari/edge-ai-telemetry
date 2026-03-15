@@ -1,0 +1,8 @@
+[package]
+name = "mavlink-telemetry"
+version = "0.1.0"
+edition = "2021"
+description = "Minimal MAVLink telemetry reader for Pixhawk over serial"
+
+[dependencies]
+mavlink = { version = "0.17", features = ["ardupilotmega", "direct-serial"] }
