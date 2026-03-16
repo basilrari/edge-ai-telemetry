@@ -14,7 +14,7 @@ use mavlink::ardupilotmega::{
 use mavlink::ardupilotmega::GpsFixType;
 use mavlink::{connect, MavConnection, MavFrame};
 use ratatui::layout::{Constraint, Direction, Layout};
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
@@ -158,16 +158,27 @@ fn mav_cmd_short(cmd: u16) -> &'static str {
     }
 }
 
+/// MAVLink frame: 0=GLOBAL (AMSL), 3=RELATIVE_ALT (rel home), 10=TERRAIN_ALT
+fn alt_frame_short(frame: u8) -> &'static str {
+    match frame {
+        0 => "AMSL",
+        3 => "rel",
+        10 => "terrain",
+        _ => "?",
+    }
+}
+
 fn waypoint_line(wp: &Waypoint, current_seq: Option<u16>) -> String {
     let prefix = if current_seq == Some(wp.seq) { "*" } else { " " };
     let cmd = mav_cmd_short(wp.command);
+    let alt_suffix = alt_frame_short(wp.frame);
     match wp.command {
-        22 => format!("{}{}: {} alt={:.0}m (target)", prefix, wp.seq, cmd, wp.alt), // TAKEOFF
+        22 => format!("{}{}: {} alt={:.0}m {} (target)", prefix, wp.seq, cmd, wp.alt, alt_suffix), // TAKEOFF
         16 | 21 | 31 | 82 => format!(
-            "{}{}: {} lat={:.5} lon={:.5} alt={:.0}m (target)",
-            prefix, wp.seq, cmd, wp.lat, wp.lon, wp.alt
+            "{}{}: {} lat={:.5} lon={:.5} alt={:.0}m {} (target)",
+            prefix, wp.seq, cmd, wp.lat, wp.lon, wp.alt, alt_suffix
         ),
-        _ => format!("{}{}: {} lat={:.5} lon={:.5} alt={:.0}m (target)", prefix, wp.seq, cmd, wp.lat, wp.lon, wp.alt),
+        _ => format!("{}{}: {} lat={:.5} lon={:.5} alt={:.0}m {} (target)", prefix, wp.seq, cmd, wp.lat, wp.lon, wp.alt, alt_suffix),
     }
 }
 
@@ -427,21 +438,50 @@ fn update_vehicle_line(state: &mut TelemetryState, label: &str, value: &str) {
     }
 }
 
+/// Panel border/style colors for a distinct look per section.
+fn vehicle_style() -> Style {
+    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+}
+fn attitude_style() -> Style {
+    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+}
+fn gps_style() -> Style {
+    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+}
+fn battery_style() -> Style {
+    Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)
+}
+fn hud_style() -> Style {
+    Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)
+}
+fn mission_style() -> Style {
+    Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD)
+}
+fn messages_style() -> Style {
+    Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD)
+}
+
 fn draw_ui(f: &mut Frame, state: &TelemetryState) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(6),
-            Constraint::Min(4),
-            Constraint::Length(5),
-            Constraint::Min(8),
-        ])
+    // Side-by-side: left column (telemetry panels), right column (mission + messages)
+    let main_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
         .split(f.area());
 
-    let top = chunks[0];
-    let mid = chunks[1];
-    let mission_chunk = chunks[2];
-    let bottom = chunks[3];
+    let left = main_chunks[0];
+    let right = main_chunks[1];
+
+    // Left column: vertical stack of panels
+    let left_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(7),
+            Constraint::Length(4),
+            Constraint::Length(5),
+            Constraint::Length(4),
+            Constraint::Length(4),
+        ])
+        .split(left);
 
     let vehicle_lines: Vec<Line> = {
         let mut lines = Vec::new();
@@ -451,11 +491,20 @@ fn draw_ui(f: &mut Frame, state: &TelemetryState) {
             state.vehicle_compid.map(|u| u.to_string()).as_deref().unwrap_or("—"),
             state.vehicle_type_name.as_deref().unwrap_or("—")
         ))));
-        lines.push(Line::from(Span::raw(format!(
-            "MODE: {}  ARMED: {}",
-            state.vehicle_mode_name.as_deref().unwrap_or("—"),
-            state.armed.map(|b| if b { "true" } else { "false" }.to_string()).as_deref().unwrap_or("—")
-        ))));
+        let armed_display = state.armed
+            .map(|b| if b { "ARMED".to_string() } else { "false".to_string() })
+            .unwrap_or_else(|| "—".to_string());
+        let armed_style = if state.armed == Some(true) {
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        lines.push(Line::from(vec![
+            Span::raw("MODE: "),
+            Span::raw(state.vehicle_mode_name.as_deref().unwrap_or("—")),
+            Span::raw("  ARMED: "),
+            Span::styled(armed_display, armed_style),
+        ]));
         lines.push(Line::from(Span::raw(format!(
             "Vbat: {:.2}V  Current: {}  Load: {}%  Uptime: {}",
             state.sys_voltage.unwrap_or(0.0),
@@ -471,21 +520,11 @@ fn draw_ui(f: &mut Frame, state: &TelemetryState) {
     let vehicle_block = Block::default()
         .title(" Vehicle ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_style(vehicle_style());
     f.render_widget(
         Paragraph::new(vehicle_lines).block(vehicle_block).wrap(Wrap { trim: true }),
-        top,
+        left_chunks[0],
     );
-
-    let mid_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(4),
-            Constraint::Length(5),
-            Constraint::Length(4),
-            Constraint::Length(4),
-        ])
-        .split(mid);
 
     let att_line = format!(
         "Roll {:.1}°  Pitch {:.1}°  Yaw {:.1}°",
@@ -496,14 +535,14 @@ fn draw_ui(f: &mut Frame, state: &TelemetryState) {
     let att_block = Block::default()
         .title(" Attitude ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Green));
+        .border_style(attitude_style());
     f.render_widget(
         Paragraph::new(att_line).block(att_block).wrap(Wrap { trim: true }),
-        mid_chunks[0],
+        left_chunks[1],
     );
 
     let home_str = match (state.home_lat, state.home_lon, state.home_alt) {
-        (Some(lat), Some(lon), Some(alt)) => format!("Home: {:.6}, {:.6}, {:.1}m", lat, lon, alt),
+        (Some(lat), Some(lon), Some(alt)) => format!("Home: {:.6}, {:.6}, {:.1}m AMSL", lat, lon, alt),
         _ => "Home: —".to_string(),
     };
     let gps_pos_line = format!(
@@ -519,10 +558,10 @@ fn draw_ui(f: &mut Frame, state: &TelemetryState) {
     let gps_block = Block::default()
         .title(" GPS / Position ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Yellow));
+        .border_style(gps_style());
     f.render_widget(
         Paragraph::new(gps_pos_line).block(gps_block).wrap(Wrap { trim: true }),
-        mid_chunks[1],
+        left_chunks[2],
     );
 
     let bat_line = format!(
@@ -534,14 +573,14 @@ fn draw_ui(f: &mut Frame, state: &TelemetryState) {
     let bat_block = Block::default()
         .title(" Battery ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Magenta));
+        .border_style(battery_style());
     f.render_widget(
         Paragraph::new(bat_line).block(bat_block).wrap(Wrap { trim: true }),
-        mid_chunks[2],
+        left_chunks[3],
     );
 
     let hud_line = format!(
-        "Air {:.1} m/s  Ground {:.1} m/s  Hdg {}°  Throttle {}  Climb {:.1} m/s",
+        "Air {:.1}  Grd {:.1}  Hdg {}°  Thr {}  Climb {:.1}",
         state.airspeed.unwrap_or(0.0),
         state.groundspeed.unwrap_or(0.0),
         state.heading.unwrap_or(0),
@@ -551,32 +590,49 @@ fn draw_ui(f: &mut Frame, state: &TelemetryState) {
     let hud_block = Block::default()
         .title(" HUD ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Blue));
+        .border_style(hud_style());
     f.render_widget(
         Paragraph::new(hud_line).block(hud_block).wrap(Wrap { trim: true }),
-        mid_chunks[3],
+        left_chunks[4],
     );
+
+    // Right column: mission (fills space) + messages (fixed height)
+    let right_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Ratio(1, 3), Constraint::Ratio(2, 3)])
+        .split(right);
 
     let mission_lines: Vec<Line> = if state.mission_waypoints.is_empty() {
         vec![Line::from(Span::raw("(no waypoints received)"))]
     } else {
-        let header = Line::from(Span::raw("(* = current WP)  alt = target m for waypoint, not drone altitude"));
+        let header = Line::from(Span::styled(
+            "(* = current WP)  alt: AMSL = above sea level, rel = relative to home",
+            Style::default().fg(Color::DarkGray),
+        ));
         let mut lines = vec![header];
         lines.extend(
             state
                 .mission_waypoints
                 .iter()
-                .map(|w| Line::from(Span::raw(waypoint_line(w, state.mission_current_seq)))),
+                .map(|w| {
+                    let raw = waypoint_line(w, state.mission_current_seq);
+                    let is_current = state.mission_current_seq == Some(w.seq);
+                    Line::from(if is_current {
+                        Span::styled(raw, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+                    } else {
+                        Span::raw(raw)
+                    })
+                }),
         );
         lines
     };
     let mission_block = Block::default()
         .title(" Mission (waypoints) ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_style(mission_style());
     f.render_widget(
         Paragraph::new(mission_lines).block(mission_block).wrap(Wrap { trim: true }),
-        mission_chunk,
+        right_chunks[0],
     );
 
     let msg_lines: Vec<Line> = if state.recent_messages.is_empty() {
@@ -591,10 +647,10 @@ fn draw_ui(f: &mut Frame, state: &TelemetryState) {
     let msg_block = Block::default()
         .title(" Messages (q = quit) ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray));
+        .border_style(messages_style());
     f.render_widget(
         Paragraph::new(msg_lines).block(msg_block).wrap(Wrap { trim: true }),
-        bottom,
+        right_chunks[1],
     );
 }
 
@@ -668,9 +724,11 @@ fn main() {
                         if mission_count.is_none() {
                             mission_count = Some(d.count);
                             if d.count > 0 {
+                                let sys = frame.header.system_id;
+                                let comp = frame.header.component_id;
                                 let req = mavlink::ardupilotmega::MISSION_REQUEST_INT_DATA {
-                                    target_system: d.target_system,
-                                    target_component: d.target_component,
+                                    target_system: sys,
+                                    target_component: comp,
                                     seq: 0,
                                 };
                                 let _ = connection.send_default(&MavMessage::MISSION_REQUEST_INT(req));
@@ -681,9 +739,11 @@ fn main() {
                         if let Some(count) = mission_count {
                             let next_seq = d.seq + 1;
                             if next_seq < count {
+                                let sys = frame.header.system_id;
+                                let comp = frame.header.component_id;
                                 let req = mavlink::ardupilotmega::MISSION_REQUEST_INT_DATA {
-                                    target_system: d.target_system,
-                                    target_component: d.target_component,
+                                    target_system: sys,
+                                    target_component: comp,
                                     seq: next_seq,
                                 };
                                 let _ = connection.send_default(&MavMessage::MISSION_REQUEST_INT(req));
