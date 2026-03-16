@@ -12,14 +12,15 @@ use mavlink::ardupilotmega::{
     COMMAND_LONG_DATA, MavCmd, MavMessage, MavModeFlag, MavState, REQUEST_DATA_STREAM_DATA,
 };
 use mavlink::ardupilotmega::GpsFixType;
-use mavlink::{connect, MavConnection};
+use mavlink::{connect, MavConnection, MavFrame};
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 
-const MAVPROXY_ADDR: &str = "tcpout:127.0.0.1:5760";
+const MAVLINK_UDP_BIND: &str = "udpin:0.0.0.0:14550";
+const MAVLINK_UDP_DISPLAY: &str = "udp:0.0.0.0:14550";
 const U16_MAX: u16 = 65535;
 const TARGET_SYSTEM: u8 = 1;
 const TARGET_COMPONENT: u8 = 1;
@@ -96,6 +97,18 @@ fn mav_mode_flags_short(m: MavModeFlag) -> String {
     }
 }
 
+fn arducopter_mode_name(custom_mode: u32) -> &'static str {
+    match custom_mode {
+        0 => "STABILIZE", 1 => "ACRO", 2 => "ALT_HOLD", 3 => "AUTO", 4 => "GUIDED",
+        5 => "LOITER", 6 => "RTL", 7 => "CIRCLE", 8 => "POSITION", 9 => "LAND",
+        10 => "DRIFT", 11 => "SPORT", 12 => "FLIP", 13 => "AUTOTUNE", 14 => "POSHOLD",
+        15 => "BRAKE", 16 => "THROW", 17 => "AVOID_ADMIN", 18 => "GUIDED_NOGPS",
+        19 => "SMART_RTL", 20 => "FLOWHOLD", 21 => "FOLLOW", 22 => "ZIGZAG",
+        23 => "SYSTEMID", 24 => "AUTOROTATE", 25 => "AUTO_RTL",
+        _ => "UNKNOWN",
+    }
+}
+
 #[derive(Default)]
 struct TelemetryState {
     heartbeat_status: Option<String>,
@@ -123,6 +136,7 @@ struct TelemetryState {
     climb: Option<f32>,
     vehicle_info: Vec<String>,
     recent_messages: VecDeque<String>,
+    first_heartbeat_logged: bool,
 }
 
 impl TelemetryState {
@@ -191,9 +205,18 @@ fn statustext_to_str(d: &mavlink::ardupilotmega::STATUSTEXT_DATA) -> String {
         .to_string()
 }
 
-fn apply_message(state: &mut TelemetryState, msg: &MavMessage) {
+fn apply_message(state: &mut TelemetryState, frame: &MavFrame<MavMessage>) {
+    let msg = &frame.msg;
     match msg {
         MavMessage::HEARTBEAT(d) => {
+            if !state.first_heartbeat_logged {
+                state.first_heartbeat_logged = true;
+                state.push_recent(format!(
+                    "HEARTBEAT from SYS={}, mode={}.",
+                    frame.header.system_id,
+                    arducopter_mode_name(d.custom_mode)
+                ));
+            }
             state.heartbeat_status = Some(mav_state_short(d.system_status).to_string());
             state.heartbeat_mode = Some(mav_mode_flags_short(d.base_mode));
             state.heartbeat_custom = Some(d.custom_mode);
@@ -410,7 +433,7 @@ fn draw_ui(f: &mut Frame, state: &TelemetryState) {
     );
 }
 
-fn run_ui(rx: mpsc::Receiver<MavMessage>) -> io::Result<()> {
+fn run_ui(rx: mpsc::Receiver<MavFrame<MavMessage>>) -> io::Result<()> {
     crossterm::terminal::enable_raw_mode()?;
     let backend = ratatui::backend::CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
@@ -422,8 +445,8 @@ fn run_ui(rx: mpsc::Receiver<MavMessage>) -> io::Result<()> {
     let mut state = TelemetryState::default();
 
     loop {
-        while let Ok(msg) = rx.try_recv() {
-            apply_message(&mut state, &msg);
+        while let Ok(frame) = rx.try_recv() {
+            apply_message(&mut state, &frame);
         }
         terminal.draw(|f| draw_ui(f, &state))?;
         if event::poll(std::time::Duration::from_millis(50))? {
@@ -444,14 +467,13 @@ fn run_ui(rx: mpsc::Receiver<MavMessage>) -> io::Result<()> {
 }
 
 fn main() {
-    let connection = match connect::<MavMessage>(MAVPROXY_ADDR) {
-        Ok(conn) => {
-            eprintln!("Connected to MAVProxy TCP:5760");
-            conn
-        }
+    eprintln!("Listening for MAVLink on {}", MAVLINK_UDP_DISPLAY);
+    eprintln!("Waiting for first heartbeat...");
+
+    let connection = match connect::<MavMessage>(MAVLINK_UDP_BIND) {
+        Ok(conn) => conn,
         Err(e) => {
-            eprintln!("Failed to connect to MAVProxy: {}", e);
-            eprintln!("Make sure MAVProxy is still running in the first terminal.");
+            eprintln!("Failed to bind: {}", e);
             std::process::exit(1);
         }
     };
@@ -462,7 +484,7 @@ fn main() {
         loop {
             match connection.recv_frame() {
                 Ok(frame) => {
-                    let _ = tx.send(frame.msg);
+                    let _ = tx.send(frame);
                 }
                 Err(_) => {}
             }

@@ -9,7 +9,8 @@ use mavlink::ardupilotmega::{
 use mavlink::ardupilotmega::GpsFixType;
 use mavlink::MavConnection;
 
-const MAVPROXY_ADDR: &str = "tcpout:127.0.0.1:5760";
+const MAVLINK_UDP_BIND: &str = "udpin:0.0.0.0:14550";
+const MAVLINK_UDP_DISPLAY: &str = "udp:0.0.0.0:14550";
 const U16_MAX: u16 = 65535;
 const TARGET_SYSTEM: u8 = 1;
 const TARGET_COMPONENT: u8 = 1;
@@ -83,6 +84,18 @@ fn mav_mode_flags_short(m: MavModeFlag) -> String {
     }
 }
 
+fn arducopter_mode_name(custom_mode: u32) -> &'static str {
+    match custom_mode {
+        0 => "STABILIZE", 1 => "ACRO", 2 => "ALT_HOLD", 3 => "AUTO", 4 => "GUIDED",
+        5 => "LOITER", 6 => "RTL", 7 => "CIRCLE", 8 => "POSITION", 9 => "LAND",
+        10 => "DRIFT", 11 => "SPORT", 12 => "FLIP", 13 => "AUTOTUNE", 14 => "POSHOLD",
+        15 => "BRAKE", 16 => "THROW", 17 => "AVOID_ADMIN", 18 => "GUIDED_NOGPS",
+        19 => "SMART_RTL", 20 => "FLOWHOLD", 21 => "FOLLOW", 22 => "ZIGZAG",
+        23 => "SYSTEMID", 24 => "AUTOROTATE", 25 => "AUTO_RTL",
+        _ => "UNKNOWN",
+    }
+}
+
 fn request_stream_rates(connection: &impl MavConnection<MavMessage>) {
     let requests: [(f32, f32, &str); 19] = [
         (MSG_ID_ATTITUDE, 1_000_000.0 / 30.0, "ATTITUDE 30 Hz"),
@@ -132,26 +145,32 @@ fn request_stream_rates(connection: &impl MavConnection<MavMessage>) {
 }
 
 fn main() {
-    println!("RAW DEBUG MODE STARTED – connecting to MAVProxy TCP:5760");
+    println!("Listening for MAVLink on {}", MAVLINK_UDP_DISPLAY);
+    println!("Waiting for first heartbeat...");
 
-    let connection = match connect::<MavMessage>(MAVPROXY_ADDR) {
+    let connection = match connect::<MavMessage>(MAVLINK_UDP_BIND) {
         Ok(conn) => conn,
         Err(e) => {
-            eprintln!("Failed to connect to MAVProxy: {}", e);
-            eprintln!("Make sure MAVProxy is still running in the first terminal.");
+            eprintln!("Failed to bind: {}", e);
             std::process::exit(1);
         }
     };
-
     request_stream_rates(&connection);
-    println!("Waiting for first heartbeat...");
 
+    let mut first_heartbeat = true;
     loop {
         match connection.recv_frame() {
             Ok(frame) => {
                 let msg = &frame.msg;
                 match msg {
                     MavMessage::HEARTBEAT(d) => {
+                        if std::mem::take(&mut first_heartbeat) {
+                            println!(
+                                "HEARTBEAT from SYS={}, mode={}.",
+                                frame.header.system_id,
+                                arducopter_mode_name(d.custom_mode)
+                            );
+                        }
                         println!(
                             "HB status={} mode_flags={} custom={}",
                             mav_state_short(d.system_status),
