@@ -1,19 +1,19 @@
-//! MAVLink telemetry reader (console println for debugging).
+//! Raw console MAVLink telemetry reader (no TUI, no threads).
 
 #![allow(deprecated)]
 
+use mavlink::connect;
 use mavlink::ardupilotmega::{
     COMMAND_LONG_DATA, MavCmd, MavMessage, MavModeFlag, MavState, REQUEST_DATA_STREAM_DATA,
 };
 use mavlink::ardupilotmega::GpsFixType;
-use mavlink::{connect, MavConnection};
+use mavlink::MavConnection;
 
 const MAVPROXY_ADDR: &str = "tcpout:127.0.0.1:5760";
 const U16_MAX: u16 = 65535;
 const TARGET_SYSTEM: u8 = 1;
 const TARGET_COMPONENT: u8 = 1;
 
-// Message IDs
 const MSG_ID_ATTITUDE: f32 = 30.0;
 const MSG_ID_GLOBAL_POSITION_INT: f32 = 33.0;
 const MSG_ID_SYS_STATUS: f32 = 1.0;
@@ -132,18 +132,19 @@ fn request_stream_rates(connection: &impl MavConnection<MavMessage>) {
 }
 
 fn main() {
+    println!("RAW DEBUG MODE STARTED – connecting to MAVProxy TCP:5760");
+
     let connection = match connect::<MavMessage>(MAVPROXY_ADDR) {
-        Ok(conn) => {
-            eprintln!("Connected to MAVProxy TCP:5760 (Mission Planner also connected on same port)");
-            conn
-        }
+        Ok(conn) => conn,
         Err(e) => {
             eprintln!("Failed to connect to MAVProxy: {}", e);
             eprintln!("Make sure MAVProxy is still running in the first terminal.");
             std::process::exit(1);
         }
     };
+
     request_stream_rates(&connection);
+    println!("Waiting for first heartbeat...");
 
     loop {
         match connection.recv_frame() {
