@@ -21,10 +21,9 @@ use mavlink::ardupilotmega::{
     COMMAND_LONG_DATA, MavCmd, MavMessage, MavModeFlag, MavState, REQUEST_DATA_STREAM_DATA,
 };
 use mavlink::ardupilotmega::GpsFixType;
-use mavlink::{Connectable, MavConnection, SerialConfig};
+use mavlink::{connect, MavConnection};
 
-const SERIAL_PORT: &str = "/dev/ttyACM0";
-const BAUD_RATE: u32 = 115200;
+const MAVPROXY_TCP: &str = "tcpout:127.0.0.1:14551";
 const U16_MAX: u16 = 65535;
 const TARGET_SYSTEM: u8 = 1;
 const TARGET_COMPONENT: u8 = 1;
@@ -631,19 +630,8 @@ fn run_ui(rx: mpsc::Receiver<MavMessage>) -> io::Result<()> {
 }
 
 fn main() {
-    let config = SerialConfig::new(SERIAL_PORT.to_string(), BAUD_RATE);
-
-    let connection = match config.connect::<MavMessage>() {
-        Ok(conn) => {
-            request_stream_rates(&conn);
-            conn
-        }
-        Err(e) => {
-            eprintln!("Failed to open serial port '{}': {}", SERIAL_PORT, e);
-            eprintln!("Ensure the Pixhawk is connected over USB and you have permission to access the port.");
-            std::process::exit(1);
-        }
-    };
+    let connection = connect::<MavMessage>(MAVPROXY_TCP).expect("Failed to connect to MAVProxy TCP");
+    request_stream_rates(&connection);
 
     let (tx, rx) = mpsc::channel();
     let _recv_handle = thread::spawn(move || {
