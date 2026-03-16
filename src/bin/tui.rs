@@ -630,9 +630,25 @@ fn draw_ui(f: &mut Frame, state: &TelemetryState) {
         .title(" Mission (waypoints) ")
         .borders(Borders::ALL)
         .border_style(mission_style());
+    let mission_area = right_chunks[0];
+    let total_lines = mission_lines.len() as u16;
+    let visible_lines = mission_area.height.saturating_sub(2); // inner height minus borders
+    let scroll_offset = if total_lines <= visible_lines {
+        0
+    } else if let Some(seq) = state.mission_current_seq {
+        let cur = 1 + seq as u16; // line index: 0 = header, 1 = wp0, ...
+        let vis = visible_lines;
+        let centered = cur.saturating_sub(vis / 2);
+        centered.min(total_lines.saturating_sub(vis))
+    } else {
+        0
+    };
     f.render_widget(
-        Paragraph::new(mission_lines).block(mission_block).wrap(Wrap { trim: true }),
-        right_chunks[0],
+        Paragraph::new(mission_lines)
+            .block(mission_block)
+            .wrap(Wrap { trim: true })
+            .scroll((scroll_offset, 0)),
+        mission_area,
     );
 
     let msg_lines: Vec<Line> = if state.recent_messages.is_empty() {
