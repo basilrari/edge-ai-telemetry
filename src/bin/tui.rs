@@ -9,7 +9,7 @@ use std::thread;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use mavlink::ardupilotmega::{
-    COMMAND_LONG_DATA, MavCmd, MavMessage, MavModeFlag, MavState, REQUEST_DATA_STREAM_DATA,
+    COMMAND_LONG_DATA, MavCmd, MavMessage, MavModeFlag, MavState, MavType, REQUEST_DATA_STREAM_DATA,
 };
 use mavlink::ardupilotmega::GpsFixType;
 use mavlink::{connect, MavConnection, MavFrame};
@@ -45,8 +45,9 @@ const MSG_ID_STATUSTEXT: f32 = 253.0;
 const MSG_ID_MISSION_CURRENT: f32 = 42.0;
 const MSG_ID_PARAM_VALUE: f32 = 22.0;
 const MSG_ID_COMMAND_ACK: f32 = 77.0;
+const MSG_ID_SYSTEM_TIME: f32 = 2.0;
 
-const RECENT_MESSAGES_MAX: usize = 8;
+const RECENT_MESSAGES_MAX: usize = 24;
 
 fn rad_to_deg(rad: f32) -> f32 {
     rad.to_degrees()
@@ -109,6 +110,78 @@ fn arducopter_mode_name(custom_mode: u32) -> &'static str {
     }
 }
 
+fn mav_type_short(t: MavType) -> String {
+    let s = format!("{:?}", t);
+    s.replace("MAV_TYPE_", "")
+}
+
+fn is_armed(base_mode: MavModeFlag) -> bool {
+    base_mode.contains(MavModeFlag::MAV_MODE_FLAG_SAFETY_ARMED)
+}
+
+/// Format time_boot_ms as human-readable uptime (e.g. "14m32s" or "2h05m").
+fn format_uptime_ms(ms: u32) -> String {
+    let secs = ms / 1000;
+    if secs >= 3600 {
+        let h = secs / 3600;
+        let m = (secs % 3600) / 60;
+        format!("{}h{:02}m", h, m)
+    } else if secs >= 60 {
+        let m = secs / 60;
+        let s = secs % 60;
+        format!("{}m{:02}s", m, s)
+    } else {
+        format!("{}s", secs)
+    }
+}
+
+fn mav_cmd_short(cmd: u16) -> &'static str {
+    match cmd {
+        16 => "WAYPOINT",
+        17 => "LOITER_UNLIM",
+        18 => "LOITER_TURNS",
+        19 => "LOITER_TIME",
+        20 => "RTL",
+        21 => "LAND",
+        22 => "TAKEOFF",
+        23 => "LAND_LOCAL",
+        24 => "TAKEOFF_LOCAL",
+        25 => "FOLLOW",
+        30 => "CONTINUE_AND_CHANGE_ALT",
+        31 => "LOITER_TO_ALT",
+        34 => "ORBIT",
+        80 => "ROI",
+        81 => "PATHPLANNING",
+        82 => "SPLINE_WAYPOINT",
+        84 => "VTOL_TAKEOFF",
+        _ => "CMD_?",
+    }
+}
+
+fn waypoint_line(wp: &Waypoint, current_seq: Option<u16>) -> String {
+    let prefix = if current_seq == Some(wp.seq) { "*" } else { " " };
+    let cmd = mav_cmd_short(wp.command);
+    match wp.command {
+        22 => format!("{}{}: {} alt={:.0}m (target)", prefix, wp.seq, cmd, wp.alt), // TAKEOFF
+        16 | 21 | 31 | 82 => format!(
+            "{}{}: {} lat={:.5} lon={:.5} alt={:.0}m (target)",
+            prefix, wp.seq, cmd, wp.lat, wp.lon, wp.alt
+        ),
+        _ => format!("{}{}: {} lat={:.5} lon={:.5} alt={:.0}m (target)", prefix, wp.seq, cmd, wp.lat, wp.lon, wp.alt),
+    }
+}
+
+#[derive(Clone)]
+struct Waypoint {
+    seq: u16,
+    command: u16,
+    lat: f64,
+    lon: f64,
+    alt: f32,
+    #[allow(dead_code)]
+    frame: u8,
+}
+
 #[derive(Default)]
 struct TelemetryState {
     heartbeat_status: Option<String>,
@@ -137,6 +210,17 @@ struct TelemetryState {
     vehicle_info: Vec<String>,
     recent_messages: VecDeque<String>,
     first_heartbeat_logged: bool,
+    vehicle_sysid: Option<u8>,
+    vehicle_compid: Option<u8>,
+    vehicle_type_name: Option<String>,
+    vehicle_mode_name: Option<String>,
+    armed: Option<bool>,
+    sys_voltage: Option<f32>,
+    sys_current: Option<f32>,
+    sys_load: Option<u16>,
+    time_boot_ms: Option<u32>,
+    mission_waypoints: Vec<Waypoint>,
+    mission_current_seq: Option<u16>,
 }
 
 impl TelemetryState {
@@ -149,7 +233,7 @@ impl TelemetryState {
 }
 
 fn request_stream_rates(connection: &impl MavConnection<MavMessage>) {
-    let requests: [(f32, f32, &str); 20] = [
+    let requests: [(f32, f32, &str); 21] = [
         (MSG_ID_ATTITUDE, 1_000_000.0 / 30.0, "ATTITUDE 30 Hz"),
         (MSG_ID_GLOBAL_POSITION_INT, 1_000_000.0 / 10.0, "GLOBAL_POSITION_INT 10 Hz"),
         (MSG_ID_SYS_STATUS, 1_000_000.0 / 5.0, "SYS_STATUS 5 Hz"),
@@ -170,6 +254,7 @@ fn request_stream_rates(connection: &impl MavConnection<MavMessage>) {
         (MSG_ID_MISSION_CURRENT, 1_000_000.0 / 1.0, "MISSION_CURRENT 1 Hz"),
         (MSG_ID_PARAM_VALUE, 0.0, "PARAM_VALUE default"),
         (MSG_ID_COMMAND_ACK, 1_000_000.0 / 5.0, "COMMAND_ACK 5 Hz"),
+        (MSG_ID_SYSTEM_TIME, 1_000_000.0 / 2.0, "SYSTEM_TIME 2 Hz"),
     ];
     for (msg_id, interval_us, _name) in requests {
         let cmd = COMMAND_LONG_DATA {
@@ -209,6 +294,11 @@ fn apply_message(state: &mut TelemetryState, frame: &MavFrame<MavMessage>) {
     let msg = &frame.msg;
     match msg {
         MavMessage::HEARTBEAT(d) => {
+            state.vehicle_sysid = Some(frame.header.system_id);
+            state.vehicle_compid = Some(frame.header.component_id);
+            state.vehicle_type_name = Some(mav_type_short(d.mavtype));
+            state.vehicle_mode_name = Some(arducopter_mode_name(d.custom_mode).to_string());
+            state.armed = Some(is_armed(d.base_mode));
             if !state.first_heartbeat_logged {
                 state.first_heartbeat_logged = true;
                 state.push_recent(format!(
@@ -247,6 +337,11 @@ fn apply_message(state: &mut TelemetryState, frame: &MavFrame<MavMessage>) {
         }
         MavMessage::SYS_STATUS(d) => {
             state.vbat = Some(d.voltage_battery as f32 / 100.0);
+            state.sys_voltage = Some(d.voltage_battery as f32 / 100.0);
+            if d.current_battery >= 0 {
+                state.sys_current = Some(d.current_battery as f32 / 100.0);
+            }
+            state.sys_load = Some(d.load);
             state.batt_pct = Some(if d.battery_remaining < 0 {
                 "?".to_string()
             } else {
@@ -294,6 +389,31 @@ fn apply_message(state: &mut TelemetryState, frame: &MavFrame<MavMessage>) {
             };
             state.push_recent(format!("ACK: {} {}", cmd_str, result_str));
         }
+        MavMessage::SYSTEM_TIME(d) => {
+            state.time_boot_ms = Some(d.time_boot_ms);
+        }
+        MavMessage::MISSION_ITEM_INT(d) => {
+            let lat = d.x as f64 / 1e7;
+            let lon = d.y as f64 / 1e7;
+            let alt = d.z;
+            let wp = Waypoint {
+                seq: d.seq,
+                command: d.command as u16,
+                lat,
+                lon,
+                alt,
+                frame: d.frame as u8,
+            };
+            if let Some(pos) = state.mission_waypoints.iter().position(|w| w.seq == d.seq) {
+                state.mission_waypoints[pos] = wp;
+            } else {
+                state.mission_waypoints.push(wp);
+                state.mission_waypoints.sort_by_key(|w| w.seq);
+            }
+        }
+        MavMessage::MISSION_CURRENT(d) => {
+            state.mission_current_seq = Some(d.seq);
+        }
         _ => {}
     }
 }
@@ -311,24 +431,42 @@ fn draw_ui(f: &mut Frame, state: &TelemetryState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(5),
+            Constraint::Length(6),
             Constraint::Min(4),
-            Constraint::Length(3),
+            Constraint::Length(5),
+            Constraint::Min(8),
         ])
         .split(f.area());
 
     let top = chunks[0];
     let mid = chunks[1];
-    let bottom = chunks[2];
+    let mission_chunk = chunks[2];
+    let bottom = chunks[3];
 
-    let vehicle_lines: Vec<Line> = if state.vehicle_info.is_empty() {
-        vec![Line::from(Span::raw("—"))]
-    } else {
-        state
-            .vehicle_info
-            .iter()
-            .map(|s| Line::from(Span::raw(s.as_str())))
-            .collect()
+    let vehicle_lines: Vec<Line> = {
+        let mut lines = Vec::new();
+        lines.push(Line::from(Span::raw(format!(
+            "SYS: {}  COMP: {}  TYPE: {}",
+            state.vehicle_sysid.map(|u| u.to_string()).as_deref().unwrap_or("—"),
+            state.vehicle_compid.map(|u| u.to_string()).as_deref().unwrap_or("—"),
+            state.vehicle_type_name.as_deref().unwrap_or("—")
+        ))));
+        lines.push(Line::from(Span::raw(format!(
+            "MODE: {}  ARMED: {}",
+            state.vehicle_mode_name.as_deref().unwrap_or("—"),
+            state.armed.map(|b| if b { "true" } else { "false" }.to_string()).as_deref().unwrap_or("—")
+        ))));
+        lines.push(Line::from(Span::raw(format!(
+            "Vbat: {:.2}V  Current: {}  Load: {}%  Uptime: {}",
+            state.sys_voltage.unwrap_or(0.0),
+            state.sys_current.map(|c| format!("{:.2}A", c)).as_deref().unwrap_or("—"),
+            state.sys_load.map(|l| (l / 10).to_string()).as_deref().unwrap_or("—"),
+            state.time_boot_ms.map(format_uptime_ms).as_deref().unwrap_or("—")
+        ))));
+        for s in &state.vehicle_info {
+            lines.push(Line::from(Span::raw(s.as_str())));
+        }
+        lines
     };
     let vehicle_block = Block::default()
         .title(" Vehicle ")
@@ -364,14 +502,19 @@ fn draw_ui(f: &mut Frame, state: &TelemetryState) {
         mid_chunks[0],
     );
 
+    let home_str = match (state.home_lat, state.home_lon, state.home_alt) {
+        (Some(lat), Some(lon), Some(alt)) => format!("Home: {:.6}, {:.6}, {:.1}m", lat, lon, alt),
+        _ => "Home: —".to_string(),
+    };
     let gps_pos_line = format!(
-        "Fix {}  Sats {}  HDOP {}  |  Lat {:.6}  Lon {:.6}  Alt {:.1}m",
+        "Fix {}  Sats {}  HDOP {}  |  Lat {:.6}  Lon {:.6}  Alt {:.1}m\n{}",
         state.gps_fix.as_deref().unwrap_or("—"),
         state.gps_sats.map(|u| u.to_string()).as_deref().unwrap_or("—"),
         state.gps_hdop.as_deref().unwrap_or("—"),
         state.lat.unwrap_or(0.0),
         state.lon.unwrap_or(0.0),
-        state.alt.unwrap_or(0.0)
+        state.alt.unwrap_or(0.0),
+        home_str
     );
     let gps_block = Block::default()
         .title(" GPS / Position ")
@@ -414,6 +557,28 @@ fn draw_ui(f: &mut Frame, state: &TelemetryState) {
         mid_chunks[3],
     );
 
+    let mission_lines: Vec<Line> = if state.mission_waypoints.is_empty() {
+        vec![Line::from(Span::raw("(no waypoints received)"))]
+    } else {
+        let header = Line::from(Span::raw("(* = current WP)  alt = target m for waypoint, not drone altitude"));
+        let mut lines = vec![header];
+        lines.extend(
+            state
+                .mission_waypoints
+                .iter()
+                .map(|w| Line::from(Span::raw(waypoint_line(w, state.mission_current_seq)))),
+        );
+        lines
+    };
+    let mission_block = Block::default()
+        .title(" Mission (waypoints) ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    f.render_widget(
+        Paragraph::new(mission_lines).block(mission_block).wrap(Wrap { trim: true }),
+        mission_chunk,
+    );
+
     let msg_lines: Vec<Line> = if state.recent_messages.is_empty() {
         vec![Line::from(Span::raw("—"))]
     } else {
@@ -424,7 +589,7 @@ fn draw_ui(f: &mut Frame, state: &TelemetryState) {
             .collect()
     };
     let msg_block = Block::default()
-        .title(" Messages ")
+        .title(" Messages (q = quit) ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::DarkGray));
     f.render_widget(
@@ -469,6 +634,7 @@ fn run_ui(rx: mpsc::Receiver<MavFrame<MavMessage>>) -> io::Result<()> {
 fn main() {
     eprintln!("Listening for MAVLink on {}", MAVLINK_UDP_DISPLAY);
     eprintln!("Waiting for first heartbeat...");
+    eprintln!("Press q to quit the TUI.");
 
     let connection = match connect::<MavMessage>(MAVLINK_UDP_BIND) {
         Ok(conn) => conn,
@@ -481,9 +647,51 @@ fn main() {
 
     let (tx, rx) = mpsc::channel();
     let _recv_handle = thread::spawn(move || {
+        let mut first_heartbeat_done = false;
+        let mut mission_count: Option<u16> = None;
         loop {
             match connection.recv_frame() {
                 Ok(frame) => {
+                    if !first_heartbeat_done {
+                        if let MavMessage::HEARTBEAT(_) = &frame.msg {
+                            first_heartbeat_done = true;
+                            let target_sys = frame.header.system_id;
+                            let target_comp = frame.header.component_id;
+                            let req = mavlink::ardupilotmega::MISSION_REQUEST_LIST_DATA {
+                                target_system: target_sys,
+                                target_component: target_comp,
+                            };
+                            let _ = connection.send_default(&MavMessage::MISSION_REQUEST_LIST(req));
+                        }
+                    }
+                    if let MavMessage::MISSION_COUNT(d) = &frame.msg {
+                        if mission_count.is_none() {
+                            mission_count = Some(d.count);
+                            if d.count > 0 {
+                                let req = mavlink::ardupilotmega::MISSION_REQUEST_INT_DATA {
+                                    target_system: d.target_system,
+                                    target_component: d.target_component,
+                                    seq: 0,
+                                };
+                                let _ = connection.send_default(&MavMessage::MISSION_REQUEST_INT(req));
+                            }
+                        }
+                    }
+                    if let MavMessage::MISSION_ITEM_INT(d) = &frame.msg {
+                        if let Some(count) = mission_count {
+                            let next_seq = d.seq + 1;
+                            if next_seq < count {
+                                let req = mavlink::ardupilotmega::MISSION_REQUEST_INT_DATA {
+                                    target_system: d.target_system,
+                                    target_component: d.target_component,
+                                    seq: next_seq,
+                                };
+                                let _ = connection.send_default(&MavMessage::MISSION_REQUEST_INT(req));
+                            } else {
+                                mission_count = None;
+                            }
+                        }
+                    }
                     let _ = tx.send(frame);
                 }
                 Err(_) => {}
