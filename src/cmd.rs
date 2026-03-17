@@ -2,7 +2,8 @@
 
 #[allow(deprecated)]
 use mavlink::ardupilotmega::{
-    COMMAND_LONG_DATA, MavCmd, MavMessage, MavMode, MavModeFlag, SET_MODE_DATA,
+    COMMAND_INT_DATA, COMMAND_LONG_DATA, MavCmd, MavFrame, MavMessage, MavMode, MavModeFlag,
+    SET_MODE_DATA,
 };
 use mavlink::MavConnection;
 
@@ -105,6 +106,8 @@ pub fn takeoff_alt(altitude_m: f32) -> MavMessage {
 /// Build a COMMAND_LONG that repositions the vehicle to a global position (guided).
 /// Latitude and longitude in degrees; altitude in meters (e.g. AMSL or relative per frame).
 /// Uses MAV_CMD_DO_REPOSITION (param5=lat, param6=lon, param7=alt).
+/// Note: ArduCopter often rejects COMMAND_LONG for DO_REPOSITION (MAV_RESULT_COMMAND_INT_ONLY);
+/// use [goto_global_command_int] for reliable guided reposition.
 pub fn goto_global(lat_deg: f64, lon_deg: f64, altitude_m: f64) -> MavMessage {
     MavMessage::COMMAND_LONG(COMMAND_LONG_DATA {
         param5: lat_deg as f32,
@@ -112,6 +115,33 @@ pub fn goto_global(lat_deg: f64, lon_deg: f64, altitude_m: f64) -> MavMessage {
         param7: altitude_m as f32,
         command: MavCmd::MAV_CMD_DO_REPOSITION,
         ..COMMAND_LONG_DATA::default()
+    })
+}
+
+/// Build COMMAND_INT for MAV_CMD_DO_REPOSITION (guided reposition). ArduCopter accepts this
+/// when COMMAND_LONG may be rejected. Uses MAV_FRAME_GLOBAL_RELATIVE_ALT; param2=1 requests
+/// transition to GUIDED. Caller must send the returned message.
+pub fn goto_global_command_int(
+    ids: VehicleIds,
+    lat_deg: f64,
+    lon_deg: f64,
+    altitude_m: f64,
+) -> MavMessage {
+    MavMessage::COMMAND_INT(COMMAND_INT_DATA {
+        target_system: ids.system_id,
+        target_component: ids.component_id,
+        frame: MavFrame::MAV_FRAME_GLOBAL_RELATIVE_ALT,
+        command: MavCmd::MAV_CMD_DO_REPOSITION,
+        current: 0,
+        autocontinue: 0,
+        param1: -1.0,  // speed: -1 = default
+        param2: 1.0,   // MAV_DO_REPOSITION_FLAGS_CHANGE_MODE: transition to GUIDED
+        param3: 0.0,
+        param4: f32::NAN, // yaw: use current
+        x: (lat_deg * 1e7).round() as i32,
+        y: (lon_deg * 1e7).round() as i32,
+        z: altitude_m as f32,
+        ..COMMAND_INT_DATA::default()
     })
 }
 
@@ -187,6 +217,54 @@ where
         target_system: ids.system_id,
         target_component: ids.component_id,
         command: MavCmd::MAV_CMD_NAV_LAND,
+        confirmation: 0,
+        param1: 0.0,
+        param2: 0.0,
+        param3: 0.0,
+        param4: 0.0,
+        param5: 0.0,
+        param6: 0.0,
+        param7: 0.0,
+        ..COMMAND_LONG_DATA::default()
+    });
+    conn.send_default(&msg).map(|_| ())
+}
+
+/// Set the current mission item index (MAV_CMD_DO_SET_MISSION_CURRENT). Use when resuming after override.
+pub fn mission_set_current<C>(
+    conn: &mut C,
+    ids: VehicleIds,
+    seq: u16,
+) -> Result<(), mavlink::error::MessageWriteError>
+where
+    C: MavConnection<MavMessage>,
+{
+    let msg = MavMessage::COMMAND_LONG(COMMAND_LONG_DATA {
+        target_system: ids.system_id,
+        target_component: ids.component_id,
+        command: MavCmd::MAV_CMD_DO_SET_MISSION_CURRENT,
+        confirmation: 0,
+        param1: seq as f32,
+        param2: 0.0,
+        param3: 0.0,
+        param4: 0.0,
+        param5: 0.0,
+        param6: 0.0,
+        param7: 0.0,
+        ..COMMAND_LONG_DATA::default()
+    });
+    conn.send_default(&msg).map(|_| ())
+}
+
+/// Start mission execution (MAV_CMD_MISSION_START). Call after set_mode_auto and mission_set_current when resuming.
+pub fn mission_start<C>(conn: &mut C, ids: VehicleIds) -> Result<(), mavlink::error::MessageWriteError>
+where
+    C: MavConnection<MavMessage>,
+{
+    let msg = MavMessage::COMMAND_LONG(COMMAND_LONG_DATA {
+        target_system: ids.system_id,
+        target_component: ids.component_id,
+        command: MavCmd::MAV_CMD_MISSION_START,
         confirmation: 0,
         param1: 0.0,
         param2: 0.0,

@@ -9,7 +9,10 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
-use drone_server::{force_arm, land, rtl, VehicleIds};
+use drone_server::{
+    force_arm, goto_global_command_int, land, mission_set_current, mission_start, rtl,
+    set_mode_auto, set_mode_guided, MissionStore, VehicleIds,
+};
 use mavlink::ardupilotmega::{
     COMMAND_LONG_DATA, MavCmd, MavMessage, MavModeFlag, MavState, MavType, REQUEST_DATA_STREAM_DATA,
 };
@@ -26,6 +29,23 @@ const MAVLINK_UDP_DISPLAY: &str = "udp:0.0.0.0:14550";
 const U16_MAX: u16 = 65535;
 const TARGET_SYSTEM: u8 = 1;
 const TARGET_COMPONENT: u8 = 1;
+/// Horizontal distance (m) to consider a waypoint "reached" during override.
+const REACHED_THRESHOLD_M: f64 = 10.0;
+
+/// State for override/resume: normal mission, paused (interrupt, wait for 'c'), running override waypoints, or resuming.
+#[derive(Clone, Debug)]
+pub enum OverrideState {
+    MissionRunning,
+    /// Interrupt: drone is hovering, press 'c' to resume mission. Can press 'w' to inject a waypoint.
+    Paused,
+    OverrideActive {
+        waypoints: Vec<(f64, f64, f64)>,
+        index: usize,
+        /// When true, resume mission after last waypoint; when false, go to Paused.
+        resume_after: bool,
+    },
+    Resuming { resume_seq: u16 },
+}
 
 const MSG_ID_ATTITUDE: f32 = 30.0;
 const MSG_ID_GLOBAL_POSITION_INT: f32 = 33.0;
@@ -579,7 +599,12 @@ fn messages_style() -> Style {
     Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD)
 }
 
-fn draw_ui(f: &mut Frame, state: &TelemetryState) {
+fn draw_ui(
+    f: &mut Frame,
+    state: &TelemetryState,
+    override_state: &Arc<Mutex<OverrideState>>,
+    waypoint_input: Option<&str>,
+) {
     // Side-by-side: left column (telemetry panels), right column (mission + messages)
     let main_chunks = Layout::default()
         .direction(Direction::Horizontal)
@@ -615,7 +640,19 @@ fn draw_ui(f: &mut Frame, state: &TelemetryState) {
             .armed
             .map(|b| if b { "yes" } else { "no" })
             .unwrap_or("?");
-        format!("SYS={}  MODE={}  ARMED={}", sys, mode, armed_str)
+        let override_str = if let Ok(os) = override_state.lock() {
+            match &*os {
+                OverrideState::MissionRunning => String::new(),
+                OverrideState::Paused => "  PAUSED (c=resume)".to_string(),
+                OverrideState::OverrideActive { waypoints, index, .. } => {
+                    format!("  OVERRIDE {}/{}", index + 1, waypoints.len())
+                }
+                OverrideState::Resuming { .. } => "  RESUMING".to_string(),
+            }
+        } else {
+            String::new()
+        };
+        format!("SYS={}  MODE={}  ARMED={}{}", sys, mode, armed_str, override_str)
     };
     f.render_widget(
         Paragraph::new(Line::from(Span::raw(status_line))).wrap(Wrap { trim: true }),
@@ -808,6 +845,40 @@ fn draw_ui(f: &mut Frame, state: &TelemetryState) {
         right_chunks[1],
     );
 
+    if let Some(buf) = waypoint_input {
+        let popup_w = 62_u16.min(f.area().width);
+        let popup_h = 6_u16.min(f.area().height);
+        let area = ratatui::layout::Rect {
+            x: f.area().width.saturating_sub(popup_w) / 2,
+            y: f.area().height.saturating_sub(popup_h) / 2,
+            width: popup_w,
+            height: popup_h,
+        };
+        f.render_widget(Clear, area);
+        let block = Block::default()
+            .title(" Override waypoint ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow))
+            .style(Style::default().bg(Color::Black));
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        let popup_text = vec![
+            Line::from(Span::styled(
+                format!("  {}_", buf),
+                Style::default().fg(Color::Yellow),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "  lat lon alt (space-sep)  or  alt only.  Enter=go  Esc=cancel",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ];
+        f.render_widget(
+            Paragraph::new(popup_text).wrap(Wrap { trim: true }),
+            inner,
+        );
+    }
+
     if state.show_help_popup {
         let help_bg = Color::White;
         let help_fg = Color::Black;
@@ -823,6 +894,10 @@ fn draw_ui(f: &mut Frame, state: &TelemetryState) {
             Line::from(Span::styled("  u     Set mode AUTO", Style::default().fg(help_fg))),
             Line::from(Span::styled("  m     Set AUTO and start mission (follow", Style::default().fg(help_fg))),
             Line::from(Span::styled("         waypoints)", Style::default().fg(help_fg))),
+            Line::from(Span::styled("  i     Interrupt: pause mission, hover here (c=resume)", Style::default().fg(help_fg))),
+            Line::from(Span::styled("  w     Inject waypoint (during mission or when paused)", Style::default().fg(help_fg))),
+            Line::from(Span::styled("         lat lon alt, or just alt. Then resume or stay paused", Style::default().fg(help_fg))),
+            Line::from(Span::styled("  c     Resume mission (when paused or after override)", Style::default().fg(help_fg))),
             Line::from(Span::styled("  r     RTL (return to launch)", Style::default().fg(help_fg))),
             Line::from(Span::styled("  l     Land", Style::default().fg(help_fg))),
             Line::from(Span::styled("  t     Takeoff 10 m", Style::default().fg(help_fg))),
@@ -852,9 +927,57 @@ fn draw_ui(f: &mut Frame, state: &TelemetryState) {
     }
 }
 
+/// Parse "lat lon alt" (three numbers) or "alt" (one number; uses current lat/lon).
+fn parse_waypoint_input(
+    s: &str,
+    current_lat: Option<f64>,
+    current_lon: Option<f64>,
+    _current_alt: Option<f64>,
+) -> Result<(f64, f64, f64), String> {
+    let parts: Vec<&str> = s.split_whitespace().collect();
+    if parts.is_empty() {
+        return Err("empty".to_string());
+    }
+    if parts.len() == 1 {
+        let alt: f64 = parts[0].parse().map_err(|_| "alt must be a number")?;
+        let lat = current_lat.ok_or("current position (GPS) needed for 'alt only'")?;
+        let lon = current_lon.ok_or("current position (GPS) needed for 'alt only'")?;
+        return Ok((lat, lon, alt));
+    }
+    if parts.len() != 3 {
+        return Err("use: lat lon alt (space-sep), or just alt".to_string());
+    }
+    let lat: f64 = parts[0].parse().map_err(|_| "lat must be a number")?;
+    let lon: f64 = parts[1].parse().map_err(|_| "lon must be a number")?;
+    let alt: f64 = parts[2].parse().map_err(|_| "alt must be a number")?;
+    if !(-90.0..=90.0).contains(&lat) {
+        return Err("lat must be -90..90".to_string());
+    }
+    if !(-180.0..=180.0).contains(&lon) {
+        return Err("lon must be -180..180".to_string());
+    }
+    Ok((lat, lon, alt))
+}
+
+fn horizontal_distance_m(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+    let dlat = (lat2 - lat1).to_radians();
+    let dlon = (lon2 - lon1).to_radians();
+    let lat1_rad = lat1.to_radians();
+    let lat2_rad = lat2.to_radians();
+    let a = dlat.sin().mul_add(
+        dlat.sin(),
+        dlon.sin() * dlon.sin() * lat1_rad.cos() * lat2_rad.cos(),
+    );
+    let a = a.min(1.0).max(0.0);
+    let c = 2.0 * (1.0 - a).sqrt().atan2(a.sqrt());
+    6371000.0 * c // Earth radius in meters
+}
+
 fn run_ui<C: MavConnection<MavMessage> + Send>(
     rx: mpsc::Receiver<MavFrame<MavMessage>>,
     conn: Arc<Mutex<C>>,
+    mission_store: Arc<Mutex<MissionStore>>,
+    override_state: Arc<Mutex<OverrideState>>,
 ) -> io::Result<()> {
     crossterm::terminal::enable_raw_mode()?;
     let backend = ratatui::backend::CrosstermBackend::new(io::stdout());
@@ -865,15 +988,91 @@ fn run_ui<C: MavConnection<MavMessage> + Send>(
     )?;
 
     let mut state = TelemetryState::default();
+    let mut waypoint_input: Option<String> = None;
 
     loop {
         while let Ok(frame) = rx.try_recv() {
             apply_message(&mut state, &frame);
         }
-        terminal.draw(|f| draw_ui(f, &state))?;
+        terminal.draw(|f| draw_ui(f, &state, &override_state, waypoint_input.as_deref()))?;
         if event::poll(std::time::Duration::from_millis(50))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+                if waypoint_input.is_some() {
+                    match key.code {
+                        KeyCode::Enter => {
+                            let s = waypoint_input.take().unwrap_or_default();
+                            let s = s.trim().to_string();
+                            let (lat, lon, alt) = match parse_waypoint_input(&s, state.lat, state.lon, state.alt) {
+                                Ok(t) => t,
+                                Err(e) => {
+                                    waypoint_input = Some(s);
+                                    state.push_recent(format!("Waypoint parse: {}", e));
+                                    continue;
+                                }
+                            };
+                            let (ok, resume_after) = {
+                                let mut os = match override_state.lock() {
+                                    Ok(g) => g,
+                                    Err(_) => continue,
+                                };
+                                if matches!(&*os, OverrideState::OverrideActive { .. }) {
+                                    state.push_recent("Override: finish current override first.".to_string());
+                                    continue;
+                                }
+                                let from_paused = matches!(&*os, OverrideState::Paused);
+                                let resume_after = !from_paused; // from mission => resume after; from paused => stay paused after
+                                if !from_paused {
+                                    let mut store = match mission_store.lock() {
+                                        Ok(g) => g,
+                                        Err(_) => continue,
+                                    };
+                                    if !store.ensure_snapshot_for_pause() {
+                                        state.push_recent("Override: no mission or current WP (wait for mission download).".to_string());
+                                        continue;
+                                    }
+                                }
+                                *os = OverrideState::OverrideActive {
+                                    waypoints: vec![(lat, lon, alt)],
+                                    index: 0,
+                                    resume_after,
+                                };
+                                (true, resume_after)
+                            };
+                            if ok {
+                                let ids = VehicleIds::new(
+                                    state.vehicle_sysid.unwrap_or(TARGET_SYSTEM),
+                                    state.vehicle_compid.unwrap_or(TARGET_COMPONENT),
+                                );
+                                if let Ok(mut c) = conn.lock() {
+                                    let _ = set_mode_guided(&mut *c, ids);
+                                    let _ = c.send_default(&goto_global_command_int(ids, lat, lon, alt));
+                                    if resume_after {
+                                        state.push_recent(format!("Override: go to {:.5} {:.5} {:.0}m, then resume mission.", lat, lon, alt));
+                                    } else {
+                                        state.push_recent(format!("Override: go to {:.5} {:.5} {:.0}m, then hover (c=resume).", lat, lon, alt));
+                                    }
+                                }
+                            }
+                        }
+                        KeyCode::Esc => {
+                            waypoint_input = None;
+                            state.push_recent("Waypoint input cancelled.".to_string());
+                        }
+                        KeyCode::Backspace => {
+                            if let Some(ref mut buf) = waypoint_input {
+                                buf.pop();
+                            }
+                        }
+                        KeyCode::Char(c) if !c.is_control() => {
+                            if let Some(ref mut buf) = waypoint_input {
+                                buf.push(c);
+                            }
+                        }
+                        _ => {}
+                    }
                     continue;
                 }
                 if state.show_help_popup {
@@ -943,6 +1142,107 @@ fn run_ui<C: MavConnection<MavMessage> + Send>(
                             state.push_recent("Sent LAND.".to_string());
                         }
                     }
+                    KeyCode::Char('w') => {
+                        if waypoint_input.is_none() {
+                            // Allow when in AUTO (during mission) or Paused (interrupt), and not already running override waypoints
+                            let in_override = override_state.lock().map(|g| matches!(&*g, OverrideState::OverrideActive { .. })).unwrap_or(false);
+                            let can_waypoint = override_state.lock().map(|g| matches!(&*g, OverrideState::MissionRunning | OverrideState::Paused)).unwrap_or(false);
+                            if !in_override && can_waypoint {
+                                waypoint_input = Some(String::new());
+                                state.push_recent("Enter waypoint: lat lon alt (space-sep), or just alt (m). Enter=go Esc=cancel".to_string());
+                            } else if in_override {
+                                state.push_recent("Waypoint: finish current override first.".to_string());
+                            } else {
+                                state.push_recent("Waypoint: start mission (u then m) or interrupt (i) first.".to_string());
+                            }
+                        }
+                    }
+                    KeyCode::Char('i') => {
+                        // Interrupt: pause mission, hover here. Press 'c' to resume. Can press 'w' to inject a waypoint while paused.
+                        if state.heartbeat_custom != Some(3) {
+                            state.push_recent("Interrupt (i): switch to AUTO and start mission first.".to_string());
+                            continue;
+                        }
+                        let (lat, lon, alt) = match (state.lat, state.lon, state.alt) {
+                            (Some(la), Some(lo), Some(al)) => (la, lo, al),
+                            _ => {
+                                state.push_recent("Interrupt: no position (need GPS).".to_string());
+                                continue;
+                            }
+                        };
+                        let ok = {
+                            let mut os = match override_state.lock() {
+                                Ok(g) => g,
+                                Err(_) => continue,
+                            };
+                            if matches!(&*os, OverrideState::OverrideActive { .. }) {
+                                state.push_recent("Interrupt: finish current override first.".to_string());
+                                continue;
+                            }
+                            let mut store = match mission_store.lock() {
+                                Ok(g) => g,
+                                Err(_) => continue,
+                            };
+                            if !store.ensure_snapshot_for_pause() {
+                                state.push_recent("Interrupt: no mission or current WP (wait for mission download).".to_string());
+                                continue;
+                            }
+                            *os = OverrideState::Paused;
+                            true
+                        };
+                        if ok {
+                            let ids = VehicleIds::new(
+                                state.vehicle_sysid.unwrap_or(TARGET_SYSTEM),
+                                state.vehicle_compid.unwrap_or(TARGET_COMPONENT),
+                            );
+                            if let Ok(mut c) = conn.lock() {
+                                let _ = set_mode_guided(&mut *c, ids);
+                                let _ = c.send_default(&goto_global_command_int(ids, lat, lon, alt));
+                                state.push_recent("Interrupt: hovering. Press c to resume mission, or w to inject waypoint.".to_string());
+                            }
+                        }
+                    }
+                    KeyCode::Char('c') => {
+                        // Cancel override: force resume mission now (get unstuck if stuck in OverrideActive/Resuming)
+                        let (snapshot_items, resume_seq) = {
+                            let store = match mission_store.lock() {
+                                Ok(g) => g,
+                                Err(_) => continue,
+                            };
+                            match store.get_snapshot() {
+                                Some((items, seq)) => (items.to_vec(), seq),
+                                None => {
+                                    if override_state.lock().map(|g| !matches!(&*g, OverrideState::MissionRunning)).unwrap_or(false) {
+                                        override_state.lock().ok().map(|mut g| *g = OverrideState::MissionRunning);
+                                        state.push_recent("Override cancelled (no snapshot). State reset.".to_string());
+                                    }
+                                    continue;
+                                }
+                            }
+                        };
+                        let ids = VehicleIds::new(
+                            state.vehicle_sysid.unwrap_or(TARGET_SYSTEM),
+                            state.vehicle_compid.unwrap_or(TARGET_COMPONENT),
+                        );
+                        {
+                            let mut store = mission_store.lock().unwrap();
+                            store.set_upload_pending(snapshot_items.clone());
+                        }
+                        let count = snapshot_items.len() as u16;
+                        if let Ok(c) = conn.lock() {
+                            let _ = c.send_default(&MavMessage::MISSION_COUNT(
+                                mavlink::ardupilotmega::MISSION_COUNT_DATA {
+                                    count,
+                                    target_system: ids.system_id,
+                                    target_component: ids.component_id,
+                                },
+                            ));
+                        }
+                        if let Ok(mut st) = override_state.lock() {
+                            *st = OverrideState::Resuming { resume_seq };
+                        }
+                        state.push_recent("Cancel override: resuming mission (upload + set current + AUTO).".to_string());
+                    }
                     _ => {}
                 }
                 }
@@ -974,10 +1274,16 @@ fn main() {
 
     let conn = Arc::new(Mutex::new(connection));
     let (tx, rx) = mpsc::channel();
+    let mission_store = Arc::new(Mutex::new(MissionStore::new()));
+    let override_state = Arc::new(Mutex::new(OverrideState::MissionRunning));
+
     let recv_conn = Arc::clone(&conn);
+    let recv_store = Arc::clone(&mission_store);
+    let recv_override = Arc::clone(&override_state);
     let _recv_handle = thread::spawn(move || {
         let mut first_heartbeat_done = false;
         let mut mission_count: Option<u16> = None;
+        let mut vehicle_ids = VehicleIds::default();
         loop {
             let frame = match recv_conn.lock().unwrap().recv_frame() {
                 Ok(f) => f,
@@ -986,31 +1292,20 @@ fn main() {
             if !first_heartbeat_done {
                 if let MavMessage::HEARTBEAT(_) = &frame.msg {
                     first_heartbeat_done = true;
-                    let target_sys = frame.header.system_id;
-                    let target_comp = frame.header.component_id;
+                    vehicle_ids = VehicleIds::new(frame.header.system_id, frame.header.component_id);
                     let req = mavlink::ardupilotmega::MISSION_REQUEST_LIST_DATA {
-                        target_system: target_sys,
-                        target_component: target_comp,
+                        target_system: frame.header.system_id,
+                        target_component: frame.header.component_id,
                     };
                     let _ = recv_conn.lock().unwrap().send_default(&MavMessage::MISSION_REQUEST_LIST(req));
                 }
             }
-            if let MavMessage::MISSION_COUNT(d) = &frame.msg {
-                if mission_count.is_none() {
-                    mission_count = Some(d.count);
-                    if d.count > 0 {
-                        let sys = frame.header.system_id;
-                        let comp = frame.header.component_id;
-                        let req = mavlink::ardupilotmega::MISSION_REQUEST_INT_DATA {
-                            target_system: sys,
-                            target_component: comp,
-                            seq: 0,
-                        };
-                        let _ = recv_conn.lock().unwrap().send_default(&MavMessage::MISSION_REQUEST_INT(req));
-                    }
-                }
-            }
+
+            // Update mission store from FC
             if let MavMessage::MISSION_ITEM_INT(d) = &frame.msg {
+                if let Ok(mut store) = recv_store.lock() {
+                    store.update_from_item(d);
+                }
                 if let Some(count) = mission_count {
                     let next_seq = d.seq + 1;
                     if next_seq < count {
@@ -1027,11 +1322,130 @@ fn main() {
                     }
                 }
             }
+            if let MavMessage::MISSION_CURRENT(d) = &frame.msg {
+                if let Ok(mut store) = recv_store.lock() {
+                    store.update_current_seq(d.seq);
+                }
+            }
+
+            // Upload handshake: FC requested an item during our upload
+            if let MavMessage::MISSION_REQUEST_INT(d) = &frame.msg {
+                if let (Ok(mut store), Ok(conn_lock)) = (recv_store.lock(), recv_conn.lock()) {
+                    if let Some(mut item) = store.take_upload_item(d.seq) {
+                        item.target_system = frame.header.system_id;
+                        item.target_component = frame.header.component_id;
+                        let _ = conn_lock.send_default(&MavMessage::MISSION_ITEM_INT(item));
+                    }
+                }
+            }
+            if let MavMessage::MISSION_ACK(_) = &frame.msg {
+                let resume_seq = if let Ok(state) = recv_override.lock() {
+                    if let OverrideState::Resuming { resume_seq } = *state {
+                        Some(resume_seq)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                if let Some(seq) = resume_seq {
+                    if let Ok(mut store) = recv_store.lock() {
+                        store.set_upload_done();
+                    }
+                    if let Ok(mut conn_lock) = recv_conn.lock() {
+                        let _ = mission_set_current(&mut *conn_lock, vehicle_ids, seq);
+                        let _ = set_mode_auto(&mut *conn_lock, vehicle_ids);
+                        let _ = mission_start(&mut *conn_lock, vehicle_ids);
+                    }
+                    // Keep snapshot so multiple interrupts/waypoint injections work in the same session
+                    if let Ok(mut state) = recv_override.lock() {
+                        *state = OverrideState::MissionRunning;
+                    }
+                }
+            }
+
+            // Override: check if we reached current override waypoint
+            if let MavMessage::GLOBAL_POSITION_INT(d) = &frame.msg {
+                let lat = d.lat as f64 / 1e7;
+                let lon = d.lon as f64 / 1e7;
+                let mut state_guard = match recv_override.lock() {
+                    Ok(g) => g,
+                    Err(_) => continue,
+                };
+                if let OverrideState::OverrideActive { waypoints, index, resume_after } = &mut *state_guard {
+                    if *index < waypoints.len() {
+                        let (wp_lat, wp_lon, _wp_alt) = waypoints[*index];
+                        let dist = horizontal_distance_m(lat, lon, wp_lat, wp_lon);
+                        if dist < REACHED_THRESHOLD_M {
+                            *index += 1;
+                            if *index >= waypoints.len() {
+                                if *resume_after {
+                                    // Override done -> start resume mission
+                                    let (snapshot_items, resume_seq) = {
+                                        let store = match recv_store.lock() {
+                                            Ok(s) => s,
+                                            Err(_) => continue,
+                                        };
+                                        match store.get_snapshot() {
+                                            Some((items, seq)) => (items.to_vec(), seq),
+                                            None => continue,
+                                        }
+                                    };
+                                    drop(state_guard);
+                                    {
+                                        let mut store = recv_store.lock().unwrap();
+                                        store.set_upload_pending(snapshot_items.clone());
+                                    }
+                                    let count = snapshot_items.len() as u16;
+                                    let _ = recv_conn.lock().unwrap().send_default(&MavMessage::MISSION_COUNT(
+                                        mavlink::ardupilotmega::MISSION_COUNT_DATA {
+                                            count,
+                                            target_system: vehicle_ids.system_id,
+                                            target_component: vehicle_ids.component_id,
+                                        },
+                                    ));
+                                    if let Ok(mut st) = recv_override.lock() {
+                                        *st = OverrideState::Resuming { resume_seq };
+                                    }
+                                } else {
+                                    // Override done -> stay paused (hover at this position)
+                                    drop(state_guard);
+                                    if let Ok(mut st) = recv_override.lock() {
+                                        *st = OverrideState::Paused;
+                                    }
+                                }
+                            } else {
+                                let (wl, wlon, walt) = waypoints[*index];
+                                drop(state_guard);
+                                let msg = goto_global_command_int(vehicle_ids, wl, wlon, walt);
+                                let _ = recv_conn.lock().unwrap().send_default(&msg);
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let MavMessage::MISSION_COUNT(d) = &frame.msg {
+                if mission_count.is_none() && recv_store.lock().map(|s| s.upload_pending.is_none()).unwrap_or(true) {
+                    mission_count = Some(d.count);
+                    if d.count > 0 {
+                        let sys = frame.header.system_id;
+                        let comp = frame.header.component_id;
+                        let req = mavlink::ardupilotmega::MISSION_REQUEST_INT_DATA {
+                            target_system: sys,
+                            target_component: comp,
+                            seq: 0,
+                        };
+                        let _ = recv_conn.lock().unwrap().send_default(&MavMessage::MISSION_REQUEST_INT(req));
+                    }
+                }
+            }
+
             let _ = tx.send(frame);
         }
     });
 
-    if let Err(e) = run_ui(rx, conn) {
+    if let Err(e) = run_ui(rx, conn, mission_store, override_state) {
         eprintln!("UI error: {}", e);
         std::process::exit(1);
     }
