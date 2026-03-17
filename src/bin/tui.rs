@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
-use mavlink_telemetry::{force_arm, land, rtl, VehicleIds};
+use drone_server::{force_arm, land, rtl, VehicleIds};
 use mavlink::ardupilotmega::{
     COMMAND_LONG_DATA, MavCmd, MavMessage, MavModeFlag, MavState, MavType, REQUEST_DATA_STREAM_DATA,
 };

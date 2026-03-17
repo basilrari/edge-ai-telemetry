@@ -1,11 +1,12 @@
 [package]
-name = "mavlink-telemetry"
+name = "drone-server"
 version = "0.1.0"
 edition = "2021"
-description = "Minimal MAVLink telemetry reader for Pixhawk over serial"
+description = "Drone Server: MAVLink telemetry and control for SAR (TUI + library)"
 default-run = "tui"
 
 [lib]
+name = "drone_server"
 
 [dependencies]
 mavlink = { version = "0.17", features = ["ardupilotmega", "direct-serial", "udp"] }
