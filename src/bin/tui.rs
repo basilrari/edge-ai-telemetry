@@ -1159,14 +1159,19 @@ fn run_ui<C: MavConnection<MavMessage> + Send>(
                     }
                     KeyCode::Char('i') => {
                         // Interrupt: pause mission, hover here. Press 'c' to resume. Can press 'w' to inject a waypoint while paused.
+                        // DO_REPOSITION uses MAV_FRAME_GLOBAL_RELATIVE_ALT so altitude must be relative to home, not AMSL.
                         if state.heartbeat_custom != Some(3) {
                             state.push_recent("Interrupt (i): switch to AUTO and start mission first.".to_string());
                             continue;
                         }
-                        let (lat, lon, alt) = match (state.lat, state.lon, state.alt) {
-                            (Some(la), Some(lo), Some(al)) => (la, lo, al),
-                            _ => {
+                        let (lat, lon, alt_rel) = match (state.lat, state.lon, state.alt, state.home_alt) {
+                            (Some(la), Some(lo), Some(al), Some(home_al)) => (la, lo, al - home_al),
+                            (Some(_), Some(_), None, _) | (None, _, _, _) | (_, None, _, _) => {
                                 state.push_recent("Interrupt: no position (need GPS).".to_string());
+                                continue;
+                            }
+                            (_, _, Some(_), None) => {
+                                state.push_recent("Interrupt: need home position (wait for HOME_POSITION).".to_string());
                                 continue;
                             }
                         };
@@ -1197,7 +1202,7 @@ fn run_ui<C: MavConnection<MavMessage> + Send>(
                             );
                             if let Ok(mut c) = conn.lock() {
                                 let _ = set_mode_guided(&mut *c, ids);
-                                let _ = c.send_default(&goto_global_command_int(ids, lat, lon, alt));
+                                let _ = c.send_default(&goto_global_command_int(ids, lat, lon, alt_rel));
                                 state.push_recent("Interrupt: hovering. Press c to resume mission, or w to inject waypoint.".to_string());
                             }
                         }
