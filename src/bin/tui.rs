@@ -5,9 +5,11 @@
 use std::collections::VecDeque;
 use std::io;
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use mavlink_telemetry::{force_arm, land, rtl, VehicleIds};
 use mavlink::ardupilotmega::{
     COMMAND_LONG_DATA, MavCmd, MavMessage, MavModeFlag, MavState, MavType, REQUEST_DATA_STREAM_DATA,
 };
@@ -16,7 +18,7 @@ use mavlink::{connect, MavConnection, MavFrame};
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 
 const MAVLINK_UDP_BIND: &str = "udpin:0.0.0.0:14550";
@@ -107,6 +109,19 @@ fn arducopter_mode_name(custom_mode: u32) -> &'static str {
         19 => "SMART_RTL", 20 => "FLOWHOLD", 21 => "FOLLOW", 22 => "ZIGZAG",
         23 => "SYSTEMID", 24 => "AUTOROTATE", 25 => "AUTO_RTL",
         _ => "UNKNOWN",
+    }
+}
+
+/// Short mode string for status bar (ArduCopter custom_mode).
+fn format_mode_short(custom_mode: u32) -> &'static str {
+    match custom_mode {
+        0 => "STAB",
+        3 => "AUTO",
+        4 => "GUIDED",
+        5 => "LOITER",
+        6 => "RTL",
+        9 => "LAND",
+        _ => "MODE?",
     }
 }
 
@@ -225,6 +240,8 @@ struct TelemetryState {
     vehicle_compid: Option<u8>,
     vehicle_type_name: Option<String>,
     vehicle_mode_name: Option<String>,
+    /// base_mode from HEARTBEAT (bits for MAV_MODE_FLAG).
+    heartbeat_base_mode_bits: Option<u8>,
     armed: Option<bool>,
     sys_voltage: Option<f32>,
     sys_current: Option<f32>,
@@ -232,6 +249,8 @@ struct TelemetryState {
     time_boot_ms: Option<u32>,
     mission_waypoints: Vec<Waypoint>,
     mission_current_seq: Option<u16>,
+    /// When true, draw the help popup (h to toggle).
+    pub show_help_popup: bool,
 }
 
 impl TelemetryState {
@@ -241,6 +260,101 @@ impl TelemetryState {
             self.recent_messages.pop_front();
         }
     }
+}
+
+/// Set target_system and target_component on a COMMAND_LONG message.
+fn with_target(mut msg: MavMessage) -> MavMessage {
+    if let MavMessage::COMMAND_LONG(ref mut d) = msg {
+        d.target_system = TARGET_SYSTEM;
+        d.target_component = TARGET_COMPONENT;
+    }
+    msg
+}
+
+// Command builders (mirror mav-core::cmd; we use local mavlink 0.17 types).
+const MODE_FLAG_CUSTOM_MODE_ENABLED: f32 = 1.0;
+const ARDUCOPTER_MODE_GUIDED: f32 = 4.0;
+const ARDUCOPTER_MODE_AUTO: f32 = 3.0;
+
+fn cmd_arm() -> MavMessage {
+    MavMessage::COMMAND_LONG(COMMAND_LONG_DATA {
+        param1: 1.0,
+        command: MavCmd::MAV_CMD_COMPONENT_ARM_DISARM,
+        ..COMMAND_LONG_DATA::default()
+    })
+}
+fn cmd_disarm() -> MavMessage {
+    MavMessage::COMMAND_LONG(COMMAND_LONG_DATA {
+        param1: 0.0,
+        command: MavCmd::MAV_CMD_COMPONENT_ARM_DISARM,
+        ..COMMAND_LONG_DATA::default()
+    })
+}
+/// Send COMMAND_LONG mode change to GUIDED (ArduCopter custom_mode 4).
+fn cmd_set_mode_guided<C>(conn: &mut C) -> Result<(), mavlink::error::MessageWriteError>
+where
+    C: MavConnection<MavMessage>,
+{
+    let msg = MavMessage::COMMAND_LONG(COMMAND_LONG_DATA {
+        target_system: TARGET_SYSTEM,
+        target_component: TARGET_COMPONENT,
+        command: MavCmd::MAV_CMD_DO_SET_MODE,
+        confirmation: 0,
+        param1: MODE_FLAG_CUSTOM_MODE_ENABLED,
+        param2: ARDUCOPTER_MODE_GUIDED,
+        param3: 0.0,
+        param4: 0.0,
+        param5: 0.0,
+        param6: 0.0,
+        param7: 0.0,
+    });
+    conn.send_default(&msg).map(|_| ())
+}
+
+/// Send COMMAND_LONG mode change to AUTO (ArduCopter custom_mode 3).
+fn cmd_set_mode_auto<C>(conn: &mut C) -> Result<(), mavlink::error::MessageWriteError>
+where
+    C: MavConnection<MavMessage>,
+{
+    let msg = MavMessage::COMMAND_LONG(COMMAND_LONG_DATA {
+        target_system: TARGET_SYSTEM,
+        target_component: TARGET_COMPONENT,
+        command: MavCmd::MAV_CMD_DO_SET_MODE,
+        confirmation: 0,
+        param1: MODE_FLAG_CUSTOM_MODE_ENABLED,
+        param2: ARDUCOPTER_MODE_AUTO,
+        param3: 0.0,
+        param4: 0.0,
+        param5: 0.0,
+        param6: 0.0,
+        param7: 0.0,
+    });
+    conn.send_default(&msg).map(|_| ())
+}
+
+fn cmd_takeoff_alt(altitude_m: f32) -> MavMessage {
+    MavMessage::COMMAND_LONG(COMMAND_LONG_DATA {
+        param7: altitude_m,
+        command: MavCmd::MAV_CMD_NAV_TAKEOFF,
+        ..COMMAND_LONG_DATA::default()
+    })
+}
+/// COMMAND_LONG to start the loaded waypoint mission (follow preloaded waypoints).
+fn cmd_mission_start() -> MavMessage {
+    MavMessage::COMMAND_LONG(COMMAND_LONG_DATA {
+        target_system: TARGET_SYSTEM,
+        target_component: TARGET_COMPONENT,
+        command: MavCmd::MAV_CMD_MISSION_START,
+        confirmation: 0,
+        param1: 0.0,
+        param2: 0.0,
+        param3: 0.0,
+        param4: 0.0,
+        param5: 0.0,
+        param6: 0.0,
+        param7: 0.0,
+        ..COMMAND_LONG_DATA::default()
+    })
 }
 
 fn request_stream_rates(connection: &impl MavConnection<MavMessage>) {
@@ -309,6 +423,7 @@ fn apply_message(state: &mut TelemetryState, frame: &MavFrame<MavMessage>) {
             state.vehicle_compid = Some(frame.header.component_id);
             state.vehicle_type_name = Some(mav_type_short(d.mavtype));
             state.vehicle_mode_name = Some(arducopter_mode_name(d.custom_mode).to_string());
+            state.heartbeat_base_mode_bits = Some(d.base_mode.bits());
             state.armed = Some(is_armed(d.base_mode));
             if !state.first_heartbeat_logged {
                 state.first_heartbeat_logged = true;
@@ -399,6 +514,9 @@ fn apply_message(state: &mut TelemetryState, frame: &MavFrame<MavMessage>) {
                 _ => "failed",
             };
             state.push_recent(format!("ACK: {} {}", cmd_str, result_str));
+            if d.command == MavCmd::MAV_CMD_COMPONENT_ARM_DISARM && d.result != mavlink::ardupilotmega::MavResult::MAV_RESULT_ACCEPTED {
+                state.push_recent("Tip: press g for GUIDED then a to arm, or f for force arm".to_string());
+            }
         }
         MavMessage::SYSTEM_TIME(d) => {
             state.time_boot_ms = Some(d.time_boot_ms);
@@ -471,10 +589,11 @@ fn draw_ui(f: &mut Frame, state: &TelemetryState) {
     let left = main_chunks[0];
     let right = main_chunks[1];
 
-    // Left column: vertical stack of panels
+    // Left column: status bar + vertical stack of panels
     let left_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(1),
             Constraint::Length(7),
             Constraint::Length(4),
             Constraint::Length(5),
@@ -482,6 +601,26 @@ fn draw_ui(f: &mut Frame, state: &TelemetryState) {
             Constraint::Length(4),
         ])
         .split(left);
+
+    let status_line = {
+        let sys = state
+            .vehicle_sysid
+            .map(|u| u.to_string())
+            .unwrap_or_else(|| "?".to_string());
+        let mode = state
+            .heartbeat_custom
+            .map(format_mode_short)
+            .unwrap_or("?");
+        let armed_str = state
+            .armed
+            .map(|b| if b { "yes" } else { "no" })
+            .unwrap_or("?");
+        format!("SYS={}  MODE={}  ARMED={}", sys, mode, armed_str)
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(Span::raw(status_line))).wrap(Wrap { trim: true }),
+        left_chunks[0],
+    );
 
     let vehicle_lines: Vec<Line> = {
         let mut lines = Vec::new();
@@ -523,7 +662,7 @@ fn draw_ui(f: &mut Frame, state: &TelemetryState) {
         .border_style(vehicle_style());
     f.render_widget(
         Paragraph::new(vehicle_lines).block(vehicle_block).wrap(Wrap { trim: true }),
-        left_chunks[0],
+        left_chunks[1],
     );
 
     let att_line = format!(
@@ -538,7 +677,7 @@ fn draw_ui(f: &mut Frame, state: &TelemetryState) {
         .border_style(attitude_style());
     f.render_widget(
         Paragraph::new(att_line).block(att_block).wrap(Wrap { trim: true }),
-        left_chunks[1],
+        left_chunks[2],
     );
 
     let home_str = match (state.home_lat, state.home_lon, state.home_alt) {
@@ -561,7 +700,7 @@ fn draw_ui(f: &mut Frame, state: &TelemetryState) {
         .border_style(gps_style());
     f.render_widget(
         Paragraph::new(gps_pos_line).block(gps_block).wrap(Wrap { trim: true }),
-        left_chunks[2],
+        left_chunks[3],
     );
 
     let bat_line = format!(
@@ -576,7 +715,7 @@ fn draw_ui(f: &mut Frame, state: &TelemetryState) {
         .border_style(battery_style());
     f.render_widget(
         Paragraph::new(bat_line).block(bat_block).wrap(Wrap { trim: true }),
-        left_chunks[3],
+        left_chunks[4],
     );
 
     let hud_line = format!(
@@ -593,7 +732,7 @@ fn draw_ui(f: &mut Frame, state: &TelemetryState) {
         .border_style(hud_style());
     f.render_widget(
         Paragraph::new(hud_line).block(hud_block).wrap(Wrap { trim: true }),
-        left_chunks[4],
+        left_chunks[5],
     );
 
     // Right column: mission (fills space) + messages (fixed height)
@@ -661,16 +800,62 @@ fn draw_ui(f: &mut Frame, state: &TelemetryState) {
             .collect()
     };
     let msg_block = Block::default()
-        .title(" Messages (q = quit) ")
+        .title(" Messages (h=help) ")
         .borders(Borders::ALL)
         .border_style(messages_style());
     f.render_widget(
         Paragraph::new(msg_lines).block(msg_block).wrap(Wrap { trim: true }),
         right_chunks[1],
     );
+
+    if state.show_help_popup {
+        let help_bg = Color::White;
+        let help_fg = Color::Black;
+        let help_text = vec![
+            Line::from(""),
+            Line::from(Span::styled(" Keys (press h or Esc to close) ", Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD))),
+            Line::from(""),
+            Line::from(Span::styled("  q     Quit the TUI", Style::default().fg(help_fg))),
+            Line::from(Span::styled("  a     Arm motors (need GUIDED or armable mode)", Style::default().fg(help_fg))),
+            Line::from(Span::styled("  d     Disarm motors", Style::default().fg(help_fg))),
+            Line::from(Span::styled("  f     Force arm (bypasses some pre-arm checks)", Style::default().fg(help_fg))),
+            Line::from(Span::styled("  g     Set mode GUIDED", Style::default().fg(help_fg))),
+            Line::from(Span::styled("  u     Set mode AUTO", Style::default().fg(help_fg))),
+            Line::from(Span::styled("  m     Set AUTO and start mission (follow", Style::default().fg(help_fg))),
+            Line::from(Span::styled("         waypoints)", Style::default().fg(help_fg))),
+            Line::from(Span::styled("  r     RTL (return to launch)", Style::default().fg(help_fg))),
+            Line::from(Span::styled("  l     Land", Style::default().fg(help_fg))),
+            Line::from(Span::styled("  t     Takeoff 10 m", Style::default().fg(help_fg))),
+            Line::from(""),
+            Line::from(Span::styled(" If arm fails: try g then a, or use f for force arm. ", Style::default().fg(Color::DarkGray))),
+        ];
+        let area = ratatui::layout::Rect {
+            x: f.area().width.saturating_sub(52) / 2,
+            y: f.area().height.saturating_sub(18) / 2,
+            width: 52.min(f.area().width),
+            height: 18.min(f.area().height),
+        };
+        f.render_widget(Clear, area);
+        let block = Block::default()
+            .title(" Help ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray))
+            .style(Style::default().bg(help_bg));
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        f.render_widget(
+            Paragraph::new(help_text)
+                .wrap(Wrap { trim: true })
+                .style(Style::default().bg(help_bg).fg(help_fg)),
+            inner,
+        );
+    }
 }
 
-fn run_ui(rx: mpsc::Receiver<MavFrame<MavMessage>>) -> io::Result<()> {
+fn run_ui<C: MavConnection<MavMessage> + Send>(
+    rx: mpsc::Receiver<MavFrame<MavMessage>>,
+    conn: Arc<Mutex<C>>,
+) -> io::Result<()> {
     crossterm::terminal::enable_raw_mode()?;
     let backend = ratatui::backend::CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
@@ -688,8 +873,78 @@ fn run_ui(rx: mpsc::Receiver<MavFrame<MavMessage>>) -> io::Result<()> {
         terminal.draw(|f| draw_ui(f, &state))?;
         if event::poll(std::time::Duration::from_millis(50))? {
             if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press && key.code == KeyCode::Char('q') {
-                    break;
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+                if state.show_help_popup {
+                    if matches!(key.code, KeyCode::Char('h') | KeyCode::Char('q') | KeyCode::Esc) {
+                        state.show_help_popup = false;
+                    }
+                } else {
+                match key.code {
+                    KeyCode::Char('q') => break,
+                    KeyCode::Char('h') => state.show_help_popup = true,
+                    KeyCode::Char('a') => {
+                        if let Ok(c) = conn.lock() {
+                            let msg = with_target(cmd_arm());
+                            let _ = c.send_default(&msg);
+                            state.push_recent("Sent ARM.".to_string());
+                        }
+                    }
+                    KeyCode::Char('d') => {
+                        if let Ok(c) = conn.lock() {
+                            let msg = with_target(cmd_disarm());
+                            let _ = c.send_default(&msg);
+                            state.push_recent("Sent DISARM.".to_string());
+                        }
+                    }
+                    KeyCode::Char('g') => {
+                        if let Ok(mut c) = conn.lock() {
+                            let _ = cmd_set_mode_guided(&mut *c);
+                            state.push_recent("Sent GUIDED mode.".to_string());
+                        }
+                    }
+                    KeyCode::Char('u') => {
+                        if let Ok(mut c) = conn.lock() {
+                            let _ = cmd_set_mode_auto(&mut *c);
+                            state.push_recent("Sent AUTO mode.".to_string());
+                        }
+                    }
+                    KeyCode::Char('m') => {
+                        if let Ok(mut c) = conn.lock() {
+                            let _ = cmd_set_mode_auto(&mut *c);
+                            let msg = with_target(cmd_mission_start());
+                            let _ = c.send_default(&msg);
+                            state.push_recent("Sent AUTO + Mission start (follow waypoints).".to_string());
+                        }
+                    }
+                    KeyCode::Char('t') => {
+                        if let Ok(c) = conn.lock() {
+                            let msg = with_target(cmd_takeoff_alt(10.0));
+                            let _ = c.send_default(&msg);
+                            state.push_recent("Sent TAKEOFF 10m.".to_string());
+                        }
+                    }
+                    KeyCode::Char('f') => {
+                        if let Ok(mut c) = conn.lock() {
+                            let _ = force_arm(&mut *c, VehicleIds::default());
+                            state.push_recent("Sent FORCE_ARM.".to_string());
+                        }
+                    }
+                    KeyCode::Char('r') => {
+                        if let Ok(mut c) = conn.lock() {
+                            let _ = rtl(&mut *c, VehicleIds::default());
+                            state.push_recent("Sent RTL.".to_string());
+                        }
+                    }
+                    KeyCode::Char('l') => {
+                        if let Ok(mut c) = conn.lock() {
+                            let _ = land(&mut *c, VehicleIds::default());
+                            state.push_recent("Sent LAND.".to_string());
+                        }
+                    }
+                    _ => {}
+                }
                 }
             }
         }
@@ -706,7 +961,7 @@ fn run_ui(rx: mpsc::Receiver<MavFrame<MavMessage>>) -> io::Result<()> {
 fn main() {
     eprintln!("Listening for MAVLink on {}", MAVLINK_UDP_DISPLAY);
     eprintln!("Waiting for first heartbeat...");
-    eprintln!("Press q to quit the TUI.");
+    eprintln!("Press h for help. q=quit.");
 
     let connection = match connect::<MavMessage>(MAVLINK_UDP_BIND) {
         Ok(conn) => conn,
@@ -717,65 +972,66 @@ fn main() {
     };
     request_stream_rates(&connection);
 
+    let conn = Arc::new(Mutex::new(connection));
     let (tx, rx) = mpsc::channel();
+    let recv_conn = Arc::clone(&conn);
     let _recv_handle = thread::spawn(move || {
         let mut first_heartbeat_done = false;
         let mut mission_count: Option<u16> = None;
         loop {
-            match connection.recv_frame() {
-                Ok(frame) => {
-                    if !first_heartbeat_done {
-                        if let MavMessage::HEARTBEAT(_) = &frame.msg {
-                            first_heartbeat_done = true;
-                            let target_sys = frame.header.system_id;
-                            let target_comp = frame.header.component_id;
-                            let req = mavlink::ardupilotmega::MISSION_REQUEST_LIST_DATA {
-                                target_system: target_sys,
-                                target_component: target_comp,
-                            };
-                            let _ = connection.send_default(&MavMessage::MISSION_REQUEST_LIST(req));
-                        }
-                    }
-                    if let MavMessage::MISSION_COUNT(d) = &frame.msg {
-                        if mission_count.is_none() {
-                            mission_count = Some(d.count);
-                            if d.count > 0 {
-                                let sys = frame.header.system_id;
-                                let comp = frame.header.component_id;
-                                let req = mavlink::ardupilotmega::MISSION_REQUEST_INT_DATA {
-                                    target_system: sys,
-                                    target_component: comp,
-                                    seq: 0,
-                                };
-                                let _ = connection.send_default(&MavMessage::MISSION_REQUEST_INT(req));
-                            }
-                        }
-                    }
-                    if let MavMessage::MISSION_ITEM_INT(d) = &frame.msg {
-                        if let Some(count) = mission_count {
-                            let next_seq = d.seq + 1;
-                            if next_seq < count {
-                                let sys = frame.header.system_id;
-                                let comp = frame.header.component_id;
-                                let req = mavlink::ardupilotmega::MISSION_REQUEST_INT_DATA {
-                                    target_system: sys,
-                                    target_component: comp,
-                                    seq: next_seq,
-                                };
-                                let _ = connection.send_default(&MavMessage::MISSION_REQUEST_INT(req));
-                            } else {
-                                mission_count = None;
-                            }
-                        }
-                    }
-                    let _ = tx.send(frame);
+            let frame = match recv_conn.lock().unwrap().recv_frame() {
+                Ok(f) => f,
+                Err(_) => continue,
+            };
+            if !first_heartbeat_done {
+                if let MavMessage::HEARTBEAT(_) = &frame.msg {
+                    first_heartbeat_done = true;
+                    let target_sys = frame.header.system_id;
+                    let target_comp = frame.header.component_id;
+                    let req = mavlink::ardupilotmega::MISSION_REQUEST_LIST_DATA {
+                        target_system: target_sys,
+                        target_component: target_comp,
+                    };
+                    let _ = recv_conn.lock().unwrap().send_default(&MavMessage::MISSION_REQUEST_LIST(req));
                 }
-                Err(_) => {}
             }
+            if let MavMessage::MISSION_COUNT(d) = &frame.msg {
+                if mission_count.is_none() {
+                    mission_count = Some(d.count);
+                    if d.count > 0 {
+                        let sys = frame.header.system_id;
+                        let comp = frame.header.component_id;
+                        let req = mavlink::ardupilotmega::MISSION_REQUEST_INT_DATA {
+                            target_system: sys,
+                            target_component: comp,
+                            seq: 0,
+                        };
+                        let _ = recv_conn.lock().unwrap().send_default(&MavMessage::MISSION_REQUEST_INT(req));
+                    }
+                }
+            }
+            if let MavMessage::MISSION_ITEM_INT(d) = &frame.msg {
+                if let Some(count) = mission_count {
+                    let next_seq = d.seq + 1;
+                    if next_seq < count {
+                        let sys = frame.header.system_id;
+                        let comp = frame.header.component_id;
+                        let req = mavlink::ardupilotmega::MISSION_REQUEST_INT_DATA {
+                            target_system: sys,
+                            target_component: comp,
+                            seq: next_seq,
+                        };
+                        let _ = recv_conn.lock().unwrap().send_default(&MavMessage::MISSION_REQUEST_INT(req));
+                    } else {
+                        mission_count = None;
+                    }
+                }
+            }
+            let _ = tx.send(frame);
         }
     });
 
-    if let Err(e) = run_ui(rx) {
+    if let Err(e) = run_ui(rx, conn) {
         eprintln!("UI error: {}", e);
         std::process::exit(1);
     }
