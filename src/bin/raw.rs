@@ -2,6 +2,7 @@
 
 #![allow(deprecated)]
 
+use drone_server::mavlink_connect::{self, MavlinkArgsError};
 use mavlink::connect;
 use mavlink::ardupilotmega::{
     COMMAND_LONG_DATA, MavCmd, MavMessage, MavModeFlag, MavState, REQUEST_DATA_STREAM_DATA,
@@ -9,8 +10,6 @@ use mavlink::ardupilotmega::{
 use mavlink::ardupilotmega::GpsFixType;
 use mavlink::MavConnection;
 
-const MAVLINK_UDP_BIND: &str = "udpin:0.0.0.0:14550";
-const MAVLINK_UDP_DISPLAY: &str = "udp:0.0.0.0:14550";
 const U16_MAX: u16 = 65535;
 const TARGET_SYSTEM: u8 = 1;
 const TARGET_COMPONENT: u8 = 1;
@@ -145,13 +144,26 @@ fn request_stream_rates(connection: &impl MavConnection<MavMessage>) {
 }
 
 fn main() {
-    println!("Listening for MAVLink on {}", MAVLINK_UDP_DISPLAY);
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let (mavlink_url, link_display) = match mavlink_connect::resolve_from_args(args) {
+        Ok(v) => v,
+        Err(MavlinkArgsError::Help) => {
+            println!("Usage: raw [OPTIONS]\n\n{}", mavlink_connect::usage_string());
+            return;
+        }
+        Err(MavlinkArgsError::Invalid(m)) => {
+            eprintln!("{m}");
+            std::process::exit(2);
+        }
+    };
+
+    println!("MAVLink: {}", link_display);
     println!("Waiting for first heartbeat...");
 
-    let connection = match connect::<MavMessage>(MAVLINK_UDP_BIND) {
+    let connection = match connect::<MavMessage>(&mavlink_url) {
         Ok(conn) => conn,
         Err(e) => {
-            eprintln!("Failed to bind: {}", e);
+            eprintln!("Failed to open MAVLink connection: {}", e);
             std::process::exit(1);
         }
     };

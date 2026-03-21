@@ -13,6 +13,7 @@ use drone_server::{
     force_arm, goto_global_command_int, land, mission_set_current, mission_start, rtl,
     set_mode_auto, set_mode_guided, MissionStore, VehicleIds,
 };
+use drone_server::mavlink_connect::{self, MavlinkArgsError};
 use mavlink::ardupilotmega::{
     COMMAND_LONG_DATA, MavCmd, MavMessage, MavModeFlag, MavState, MavType, REQUEST_DATA_STREAM_DATA,
 };
@@ -24,8 +25,6 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 
-const MAVLINK_UDP_BIND: &str = "udpin:0.0.0.0:14550";
-const MAVLINK_UDP_DISPLAY: &str = "udp:0.0.0.0:14550";
 const U16_MAX: u16 = 65535;
 const TARGET_SYSTEM: u8 = 1;
 const TARGET_COMPONENT: u8 = 1;
@@ -1264,14 +1263,27 @@ fn run_ui<C: MavConnection<MavMessage> + Send>(
 }
 
 fn main() {
-    eprintln!("Listening for MAVLink on {}", MAVLINK_UDP_DISPLAY);
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let (mavlink_url, link_display) = match mavlink_connect::resolve_from_args(args) {
+        Ok(v) => v,
+        Err(MavlinkArgsError::Help) => {
+            eprintln!("Usage: tui [OPTIONS]\n\n{}", mavlink_connect::usage_string());
+            return;
+        }
+        Err(MavlinkArgsError::Invalid(m)) => {
+            eprintln!("{m}");
+            std::process::exit(2);
+        }
+    };
+
+    eprintln!("MAVLink: {}", link_display);
     eprintln!("Waiting for first heartbeat...");
     eprintln!("Press h for help. q=quit.");
 
-    let connection = match connect::<MavMessage>(MAVLINK_UDP_BIND) {
+    let connection = match connect::<MavMessage>(&mavlink_url) {
         Ok(conn) => conn,
         Err(e) => {
-            eprintln!("Failed to bind: {}", e);
+            eprintln!("Failed to open MAVLink connection: {}", e);
             std::process::exit(1);
         }
     };

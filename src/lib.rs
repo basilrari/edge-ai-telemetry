@@ -1,6 +1,7 @@
 pub mod mission;
 pub mod cmd;
 pub mod mission_store;
+pub mod mavlink_connect;
 
 // Re-export command helpers for building MAVLink messages.
 pub use cmd::{

@@ -24,20 +24,78 @@ cargo run --bin tui
 cargo run --bin raw
 ```
 
-- **Connection**: TUI and raw bind to `udpin:0.0.0.0:14550` by default. The flight controller is reached via USB (e.g. `/dev/ttyACM0`) or UDP depending on your MAVLink router; for remote control, use SSH tunnel (or VPN) so your ground station connects to the Jetson, and the Jetson runs this crate talking to the FC over USB.
+Use `--` before flags so they are passed to the binary (not to Cargo), e.g. `cargo run -- --help`.
+
+## MAVLink connection (UDP vs USB serial)
+
+The **`tui`** and **`raw`** binaries use the same rules to choose how they connect. Resolution order:
+
+1. **`--mavlink-url <URL>`** — full address for `mavlink::connect` (e.g. UDP listen or serial).
+2. **`--serial [DEVICE]`** — direct connection to the flight controller over USB serial on the Jetson. Optional **`--baud <RATE>`** (default **115200**). Default device **`/dev/ttyACM0`** if you omit the path.
+3. **`--udp`** — force the default UDP listen below and **ignore** `MAVLINK_URL`.
+4. **`MAVLINK_URL`** environment variable — used when none of the above apply.
+5. **Default** — listen on UDP **`udpin:0.0.0.0:14550`** (typical when MAVProxy or a GCS forwards MAVLink to this port).
+
+### Examples
+
+**UDP / MAVProxy (default)** — no arguments:
+
+```bash
+cargo run
+cargo run --bin raw
+```
+
+**Pixhawk plugged into the Jetson over USB** (often `/dev/ttyACM0`; sometimes `/dev/ttyUSB0`):
+
+```bash
+cargo run -- --serial
+cargo run -- --serial /dev/ttyACM0 --baud 57600
+cargo run --bin raw -- --serial
+```
+
+**Explicit URL** (same formats the `mavlink` crate accepts):
+
+```bash
+cargo run -- --mavlink-url serial:/dev/ttyACM0:115200
+cargo run -- --mavlink-url udpin:0.0.0.0:14550
+```
+
+**Environment variable**:
+
+```bash
+export MAVLINK_URL=serial:/dev/ttyACM0:57600
+cargo run
+```
+
+**Help**:
+
+```bash
+cargo run -- --help
+```
+
+### Finding the device and fixing permissions
+
+- List serial devices: `ls -l /dev/ttyACM* /dev/ttyUSB*`
+- After plugging in the FC, check the kernel log: `dmesg | tail`
+- If you get permission errors, add your user to the **`dialout`** group (then log out and back in), or adjust udev rules.
+
+Match **`--baud`** (or the baud in `MAVLINK_URL` / `--mavlink-url`) to the baud configured on that serial port on the autopilot (e.g. ArduPilot `SERIAL*_BAUD`).
+
+For remote control over the network while the Jetson talks to the FC over USB, run this crate on the Jetson with **`--serial`**, or use a MAVLink router that exposes UDP and run with the default **`udpin:0.0.0.0:14550`**, plus SSH tunnel or VPN as needed.
 
 ## Project structure
 
 ```
 drone-server/
 ├── src/
-│   ├── lib.rs       # Library root: cmd, mission, re-exports
-│   ├── cmd.rs       # MAVLink command builders (arm, rtl, land, set_mode_*, etc.)
-│   ├── mission.rs   # Mission types (Waypoint, Mission, WaypointCommand)
-│   ├── main.rs      # (removed; default is tui)
+│   ├── lib.rs              # Library root: cmd, mission, mavlink_connect, re-exports
+│   ├── mavlink_connect.rs  # CLI/env MAVLink URL (UDP vs serial) for binaries
+│   ├── cmd.rs              # MAVLink command builders (arm, rtl, land, set_mode_*, etc.)
+│   ├── mission.rs          # Mission types (Waypoint, Mission, WaypointCommand)
+│   ├── main.rs             # (removed; default is tui)
 │   └── bin/
-│       ├── tui.rs   # TUI entrypoint
-│       └── raw.rs   # Raw console entrypoint
+│       ├── tui.rs          # TUI entrypoint
+│       └── raw.rs          # Raw console entrypoint
 ├── Cargo.toml
 ├── ROADMAP.md       # Control roadmap (steps 1–6)
 ├── README.md
