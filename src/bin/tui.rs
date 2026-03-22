@@ -4,9 +4,12 @@
 
 use std::collections::VecDeque;
 use std::io;
+use std::net::{SocketAddr, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use drone_server::{
@@ -30,6 +33,8 @@ const TARGET_SYSTEM: u8 = 1;
 const TARGET_COMPONENT: u8 = 1;
 /// Horizontal distance (m) to consider a waypoint "reached" during override.
 const REACHED_THRESHOLD_M: f64 = 10.0;
+const INTERNET_OFFLINE_RTL_AFTER_SECS: u64 = 30;
+const INTERNET_CHECK_PERIOD_SECS: u64 = 2;
 
 /// State for override/resume: normal mission, paused (interrupt, wait for 'c'), running override waypoints, or resuming.
 #[derive(Clone, Debug)]
@@ -227,6 +232,15 @@ struct Waypoint {
     frame: u8,
 }
 
+#[derive(Default, Clone, Copy)]
+struct NetWatchdogStatus {
+    online: Option<bool>,
+    last_check: Option<Instant>,
+    last_ok: Option<Instant>,
+    offline_since: Option<Instant>,
+    rtl_sent_for_current_outage: bool,
+}
+
 #[derive(Default)]
 struct TelemetryState {
     heartbeat_status: Option<String>,
@@ -268,6 +282,11 @@ struct TelemetryState {
     time_boot_ms: Option<u32>,
     mission_waypoints: Vec<Waypoint>,
     mission_current_seq: Option<u16>,
+    net_online: Option<bool>,
+    net_secs_since_last_check: Option<u64>,
+    net_secs_since_last_ok: Option<u64>,
+    net_offline_secs: Option<u64>,
+    net_rtl_sent_for_current_outage: bool,
     /// When true, draw the help popup (h to toggle).
     pub show_help_popup: bool,
 }
@@ -376,7 +395,17 @@ fn cmd_mission_start() -> MavMessage {
     })
 }
 
-fn request_stream_rates(connection: &impl MavConnection<MavMessage>) {
+/// `MAV_COMP_ID_AUTOPILOT1` = 1. Companion / router heartbeats often use another component; if we
+/// send `SET_MESSAGE_INTERVAL` there, the flight controller never streams GPS / SYS_STATUS / HUD.
+fn heartbeat_from_autopilot(hdr: &MavFrame<MavMessage>, mavtype: MavType) -> bool {
+    const MAV_COMP_ID_AUTOPILOT1: u8 = 1;
+    if mavtype == MavType::MAV_TYPE_GCS {
+        return false;
+    }
+    hdr.header.component_id == MAV_COMP_ID_AUTOPILOT1
+}
+
+fn request_stream_rates(connection: &impl MavConnection<MavMessage>, ids: VehicleIds) {
     let requests: [(f32, f32, &str); 21] = [
         (MSG_ID_ATTITUDE, 1_000_000.0 / 30.0, "ATTITUDE 30 Hz"),
         (MSG_ID_GLOBAL_POSITION_INT, 1_000_000.0 / 10.0, "GLOBAL_POSITION_INT 10 Hz"),
@@ -410,20 +439,36 @@ fn request_stream_rates(connection: &impl MavConnection<MavMessage>) {
             param6: 0.0,
             param7: 0.0,
             command: MavCmd::MAV_CMD_SET_MESSAGE_INTERVAL,
-            target_system: TARGET_SYSTEM,
-            target_component: TARGET_COMPONENT,
+            target_system: ids.system_id,
+            target_component: ids.component_id,
             confirmation: 0,
         };
         let _ = connection.send_default(&MavMessage::COMMAND_LONG(cmd));
     }
-    let fallback = REQUEST_DATA_STREAM_DATA {
-        req_message_rate: 10,
-        target_system: TARGET_SYSTEM,
-        target_component: TARGET_COMPONENT,
-        req_stream_id: 0,
-        start_stop: 1,
-    };
-    let _ = connection.send_default(&MavMessage::REQUEST_DATA_STREAM(fallback));
+    // Legacy stream IDs (ArduPilot still honors these when message intervals are ignored).
+    for stream_id in 0u8..=6u8 {
+        let req = REQUEST_DATA_STREAM_DATA {
+            req_message_rate: 5,
+            target_system: ids.system_id,
+            target_component: ids.component_id,
+            req_stream_id: stream_id,
+            start_stop: 1,
+        };
+        let _ = connection.send_default(&MavMessage::REQUEST_DATA_STREAM(req));
+    }
+}
+
+fn internet_is_reachable() -> bool {
+    // Use raw IP endpoints so this check does not depend on DNS availability.
+    const TARGETS: [&str; 3] = ["1.1.1.1:53", "8.8.8.8:53", "1.1.1.1:443"];
+    let timeout = Duration::from_millis(1200);
+    TARGETS.iter().any(|target| {
+        target
+            .parse::<SocketAddr>()
+            .ok()
+            .map(|addr| TcpStream::connect_timeout(&addr, timeout).is_ok())
+            .unwrap_or(false)
+    })
 }
 
 fn statustext_to_str(d: &mavlink::ardupilotmega::STATUSTEXT_DATA) -> String {
@@ -651,7 +696,28 @@ fn draw_ui(
         } else {
             String::new()
         };
-        format!("SYS={}  MODE={}  ARMED={}{}", sys, mode, armed_str, override_str)
+        let net_str = match state.net_online {
+            Some(true) => format!(
+                "  NET=UP ok:{}s chk:{}s",
+                state.net_secs_since_last_ok.unwrap_or(0),
+                state.net_secs_since_last_check.unwrap_or(0)
+            ),
+            Some(false) => format!(
+                "  NET=DOWN {}s{} chk:{}s",
+                state.net_offline_secs.unwrap_or(0),
+                if state.net_rtl_sent_for_current_outage {
+                    " RTL_SENT"
+                } else {
+                    ""
+                },
+                state.net_secs_since_last_check.unwrap_or(0)
+            ),
+            None => "  NET=CHECKING".to_string(),
+        };
+        format!(
+            "SYS={}  MODE={}  ARMED={}{}{}",
+            sys, mode, armed_str, net_str, override_str
+        )
     };
     f.render_widget(
         Paragraph::new(Line::from(Span::raw(status_line))).wrap(Wrap { trim: true }),
@@ -977,6 +1043,7 @@ fn run_ui<C: MavConnection<MavMessage> + Send>(
     conn: Arc<Mutex<C>>,
     mission_store: Arc<Mutex<MissionStore>>,
     override_state: Arc<Mutex<OverrideState>>,
+    net_watchdog_status: Arc<Mutex<NetWatchdogStatus>>,
 ) -> io::Result<()> {
     crossterm::terminal::enable_raw_mode()?;
     let backend = ratatui::backend::CrosstermBackend::new(io::stdout());
@@ -992,6 +1059,15 @@ fn run_ui<C: MavConnection<MavMessage> + Send>(
     loop {
         while let Ok(frame) = rx.try_recv() {
             apply_message(&mut state, &frame);
+        }
+        if let Ok(ns) = net_watchdog_status.lock() {
+            let now = Instant::now();
+            state.net_online = ns.online;
+            state.net_secs_since_last_check =
+                ns.last_check.map(|t| now.duration_since(t).as_secs());
+            state.net_secs_since_last_ok = ns.last_ok.map(|t| now.duration_since(t).as_secs());
+            state.net_offline_secs = ns.offline_since.map(|t| now.duration_since(t).as_secs());
+            state.net_rtl_sent_for_current_outage = ns.rtl_sent_for_current_outage;
         }
         terminal.draw(|f| draw_ui(f, &state, &override_state, waypoint_input.as_deref()))?;
         if event::poll(std::time::Duration::from_millis(50))? {
@@ -1280,25 +1356,30 @@ fn main() {
     eprintln!("Waiting for first heartbeat...");
     eprintln!("Press h for help. q=quit.");
 
-    let connection = match connect::<MavMessage>(&mavlink_url) {
+    let mut connection = match connect::<MavMessage>(&mavlink_url) {
         Ok(conn) => conn,
         Err(e) => {
-            eprintln!("Failed to open MAVLink connection: {}", e);
+            eprintln!("{}", mavlink_connect::open_error_message(&mavlink_url, &e));
             std::process::exit(1);
         }
     };
-    request_stream_rates(&connection);
+    mavlink_connect::tune_connection(&mut connection);
 
     let conn = Arc::new(Mutex::new(connection));
     let (tx, rx) = mpsc::channel();
     let mission_store = Arc::new(Mutex::new(MissionStore::new()));
     let override_state = Arc::new(Mutex::new(OverrideState::MissionRunning));
+    let watchdog_vehicle_ids = Arc::new(Mutex::new(None::<VehicleIds>));
+    let watchdog_armed = Arc::new(AtomicBool::new(false));
+    let net_watchdog_status = Arc::new(Mutex::new(NetWatchdogStatus::default()));
 
     let recv_conn = Arc::clone(&conn);
     let recv_store = Arc::clone(&mission_store);
     let recv_override = Arc::clone(&override_state);
+    let recv_watchdog_vehicle_ids = Arc::clone(&watchdog_vehicle_ids);
+    let recv_watchdog_armed = Arc::clone(&watchdog_armed);
     let _recv_handle = thread::spawn(move || {
-        let mut first_heartbeat_done = false;
+        let mut autopilot_handshake_done = false;
         let mut mission_count: Option<u16> = None;
         let mut vehicle_ids = VehicleIds::default();
         loop {
@@ -1306,15 +1387,30 @@ fn main() {
                 Ok(f) => f,
                 Err(_) => continue,
             };
-            if !first_heartbeat_done {
-                if let MavMessage::HEARTBEAT(_) = &frame.msg {
-                    first_heartbeat_done = true;
-                    vehicle_ids = VehicleIds::new(frame.header.system_id, frame.header.component_id);
-                    let req = mavlink::ardupilotmega::MISSION_REQUEST_LIST_DATA {
-                        target_system: frame.header.system_id,
-                        target_component: frame.header.component_id,
-                    };
-                    let _ = recv_conn.lock().unwrap().send_default(&MavMessage::MISSION_REQUEST_LIST(req));
+            if !autopilot_handshake_done {
+                if let MavMessage::HEARTBEAT(d) = &frame.msg {
+                    if heartbeat_from_autopilot(&frame, d.mavtype) {
+                        autopilot_handshake_done = true;
+                        vehicle_ids =
+                            VehicleIds::new(frame.header.system_id, frame.header.component_id);
+                        let req = mavlink::ardupilotmega::MISSION_REQUEST_LIST_DATA {
+                            target_system: frame.header.system_id,
+                            target_component: frame.header.component_id,
+                        };
+                        let c = recv_conn.lock().unwrap();
+                        let _ = c.send_default(&MavMessage::MISSION_REQUEST_LIST(req));
+                        request_stream_rates(&*c, vehicle_ids);
+                    }
+                }
+            }
+            if let MavMessage::HEARTBEAT(d) = &frame.msg {
+                if heartbeat_from_autopilot(&frame, d.mavtype) {
+                    let ids = VehicleIds::new(frame.header.system_id, frame.header.component_id);
+                    vehicle_ids = ids;
+                    if let Ok(mut g) = recv_watchdog_vehicle_ids.lock() {
+                        *g = Some(ids);
+                    }
+                    recv_watchdog_armed.store(is_armed(d.base_mode), Ordering::Relaxed);
                 }
             }
 
@@ -1462,7 +1558,64 @@ fn main() {
         }
     });
 
-    if let Err(e) = run_ui(rx, conn, mission_store, override_state) {
+    let watchdog_conn = Arc::clone(&conn);
+    let watchdog_vehicle_ids_thread = Arc::clone(&watchdog_vehicle_ids);
+    let watchdog_armed_thread = Arc::clone(&watchdog_armed);
+    let net_watchdog_status_thread = Arc::clone(&net_watchdog_status);
+    let _net_watchdog_handle = thread::spawn(move || {
+        loop {
+            thread::sleep(Duration::from_secs(INTERNET_CHECK_PERIOD_SECS));
+            let now = Instant::now();
+            let online = internet_is_reachable();
+            if let Ok(mut s) = net_watchdog_status_thread.lock() {
+                s.last_check = Some(now);
+                s.online = Some(online);
+                if online {
+                    s.last_ok = Some(now);
+                    s.offline_since = None;
+                    s.rtl_sent_for_current_outage = false;
+                } else if s.offline_since.is_none() {
+                    s.offline_since = Some(now);
+                }
+            }
+            if online {
+                continue;
+            }
+            let (offline_elapsed, already_sent) = match net_watchdog_status_thread.lock() {
+                Ok(s) => (
+                    s.offline_since
+                        .map(|t| now.duration_since(t))
+                        .unwrap_or(Duration::from_secs(0)),
+                    s.rtl_sent_for_current_outage,
+                ),
+                Err(_) => continue,
+            };
+            if already_sent {
+                continue;
+            }
+            if offline_elapsed < Duration::from_secs(INTERNET_OFFLINE_RTL_AFTER_SECS) {
+                continue;
+            }
+            if !watchdog_armed_thread.load(Ordering::Relaxed) {
+                continue;
+            }
+            let ids = match watchdog_vehicle_ids_thread.lock() {
+                Ok(g) => *g,
+                Err(_) => None,
+            };
+            if let Some(ids) = ids {
+                if let Ok(mut c) = watchdog_conn.lock() {
+                    let _ = rtl(&mut *c, ids);
+                    if let Ok(mut s) = net_watchdog_status_thread.lock() {
+                        s.rtl_sent_for_current_outage = true;
+                    }
+                    eprintln!("Failsafe: internet offline >=30s, sent RTL.");
+                }
+            }
+        }
+    });
+
+    if let Err(e) = run_ui(rx, conn, mission_store, override_state, net_watchdog_status) {
         eprintln!("UI error: {}", e);
         std::process::exit(1);
     }

@@ -3,16 +3,15 @@
 #![allow(deprecated)]
 
 use drone_server::mavlink_connect::{self, MavlinkArgsError};
+use drone_server::VehicleIds;
 use mavlink::connect;
 use mavlink::ardupilotmega::{
-    COMMAND_LONG_DATA, MavCmd, MavMessage, MavModeFlag, MavState, REQUEST_DATA_STREAM_DATA,
+    COMMAND_LONG_DATA, MavCmd, MavMessage, MavModeFlag, MavState, MavType, REQUEST_DATA_STREAM_DATA,
 };
 use mavlink::ardupilotmega::GpsFixType;
-use mavlink::MavConnection;
+use mavlink::{MavConnection, MavFrame};
 
 const U16_MAX: u16 = 65535;
-const TARGET_SYSTEM: u8 = 1;
-const TARGET_COMPONENT: u8 = 1;
 
 const MSG_ID_ATTITUDE: f32 = 30.0;
 const MSG_ID_GLOBAL_POSITION_INT: f32 = 33.0;
@@ -95,7 +94,15 @@ fn arducopter_mode_name(custom_mode: u32) -> &'static str {
     }
 }
 
-fn request_stream_rates(connection: &impl MavConnection<MavMessage>) {
+fn heartbeat_from_autopilot(frame: &MavFrame<MavMessage>, mavtype: MavType) -> bool {
+    const MAV_COMP_ID_AUTOPILOT1: u8 = 1;
+    if mavtype == MavType::MAV_TYPE_GCS {
+        return false;
+    }
+    frame.header.component_id == MAV_COMP_ID_AUTOPILOT1
+}
+
+fn request_stream_rates(connection: &impl MavConnection<MavMessage>, ids: VehicleIds) {
     let requests: [(f32, f32, &str); 19] = [
         (MSG_ID_ATTITUDE, 1_000_000.0 / 30.0, "ATTITUDE 30 Hz"),
         (MSG_ID_GLOBAL_POSITION_INT, 1_000_000.0 / 10.0, "GLOBAL_POSITION_INT 10 Hz"),
@@ -127,20 +134,22 @@ fn request_stream_rates(connection: &impl MavConnection<MavMessage>) {
             param6: 0.0,
             param7: 0.0,
             command: MavCmd::MAV_CMD_SET_MESSAGE_INTERVAL,
-            target_system: TARGET_SYSTEM,
-            target_component: TARGET_COMPONENT,
+            target_system: ids.system_id,
+            target_component: ids.component_id,
             confirmation: 0,
         };
         let _ = connection.send_default(&MavMessage::COMMAND_LONG(cmd));
     }
-    let fallback = REQUEST_DATA_STREAM_DATA {
-        req_message_rate: 10,
-        target_system: TARGET_SYSTEM,
-        target_component: TARGET_COMPONENT,
-        req_stream_id: 0,
-        start_stop: 1,
-    };
-    let _ = connection.send_default(&MavMessage::REQUEST_DATA_STREAM(fallback));
+    for stream_id in 0u8..=6u8 {
+        let req = REQUEST_DATA_STREAM_DATA {
+            req_message_rate: 5,
+            target_system: ids.system_id,
+            target_component: ids.component_id,
+            req_stream_id: stream_id,
+            start_stop: 1,
+        };
+        let _ = connection.send_default(&MavMessage::REQUEST_DATA_STREAM(req));
+    }
 }
 
 fn main() {
@@ -160,28 +169,31 @@ fn main() {
     println!("MAVLink: {}", link_display);
     println!("Waiting for first heartbeat...");
 
-    let connection = match connect::<MavMessage>(&mavlink_url) {
+    let mut connection = match connect::<MavMessage>(&mavlink_url) {
         Ok(conn) => conn,
         Err(e) => {
-            eprintln!("Failed to open MAVLink connection: {}", e);
+            eprintln!("{}", mavlink_connect::open_error_message(&mavlink_url, &e));
             std::process::exit(1);
         }
     };
-    request_stream_rates(&connection);
+    mavlink_connect::tune_connection(&mut connection);
 
-    let mut first_heartbeat = true;
+    let mut first_autopilot_heartbeat = true;
     loop {
         match connection.recv_frame() {
             Ok(frame) => {
                 let msg = &frame.msg;
                 match msg {
                     MavMessage::HEARTBEAT(d) => {
-                        if std::mem::take(&mut first_heartbeat) {
+                        if first_autopilot_heartbeat && heartbeat_from_autopilot(&frame, d.mavtype) {
+                            first_autopilot_heartbeat = false;
                             println!(
                                 "HEARTBEAT from SYS={}, mode={}.",
                                 frame.header.system_id,
                                 arducopter_mode_name(d.custom_mode)
                             );
+                            let ids = VehicleIds::new(frame.header.system_id, frame.header.component_id);
+                            request_stream_rates(&connection, ids);
                         }
                         println!(
                             "HB status={} mode_flags={} custom={}",
