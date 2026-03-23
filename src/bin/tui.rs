@@ -1247,28 +1247,14 @@ fn run_ui<C: MavConnection<MavMessage> + Send>(
     let mut state = TelemetryState::default();
     let mut waypoint_input: Option<String> = None;
 
-    loop {
-        while let Ok(frame) = rx.try_recv() {
-            apply_message(&mut state, &frame);
-        }
-        while let Ok(line) = log_rx.try_recv() {
-            state.push_recent(line);
-        }
-        check_pending_feedback_timeout(&mut state);
-        if let Ok(ns) = net_watchdog_status.lock() {
-            let now = Instant::now();
-            state.net_online = ns.online;
-            state.net_secs_since_last_check =
-                ns.last_check.map(|t| now.duration_since(t).as_secs());
-            state.net_secs_since_last_ok = ns.last_ok.map(|t| now.duration_since(t).as_secs());
-            state.net_offline_secs = ns.offline_since.map(|t| now.duration_since(t).as_secs());
-            state.net_rtl_sent_for_current_outage = ns.rtl_sent_for_current_outage;
-        }
-        terminal.draw(|f| draw_ui(f, &state, &override_state, waypoint_input.as_deref()))?;
-        if event::poll(std::time::Duration::from_millis(50))? {
-            if let Event::Key(key) = event::read()? {
+    'ui: loop {
+        // Handle keys before MAVLink so "[1] TUI → link" is queued before any COMMAND_ACK in the
+        // same frame, and the following draw shows it immediately.
+        'keys: while event::poll(Duration::ZERO)? {
+            match event::read()? {
+                Event::Key(key) => {
                 if key.kind != KeyEventKind::Press {
-                    continue;
+                    continue 'keys;
                 }
                 if waypoint_input.is_some() {
                     match key.code {
@@ -1280,28 +1266,28 @@ fn run_ui<C: MavConnection<MavMessage> + Send>(
                                 Err(e) => {
                                     waypoint_input = Some(s);
                                     state.push_recent(format!("Waypoint parse: {}", e));
-                                    continue;
+                                    continue 'ui;
                                 }
                             };
                             let (ok, resume_after) = {
                                 let mut os = match override_state.lock() {
                                     Ok(g) => g,
-                                    Err(_) => continue,
+                                    Err(_) => continue 'ui,
                                 };
                                 if matches!(&*os, OverrideState::OverrideActive { .. }) {
                                     state.push_recent("Override: finish current override first.".to_string());
-                                    continue;
+                                    continue 'ui;
                                 }
                                 let from_paused = matches!(&*os, OverrideState::Paused);
                                 let resume_after = !from_paused; // from mission => resume after; from paused => stay paused after
                                 if !from_paused {
                                     let mut store = match mission_store.lock() {
                                         Ok(g) => g,
-                                        Err(_) => continue,
+                                        Err(_) => continue 'ui,
                                     };
                                     if !store.ensure_snapshot_for_pause() {
                                         state.push_recent("Override: no mission or current WP (wait for mission download).".to_string());
-                                        continue;
+                                        continue 'ui;
                                     }
                                 }
                                 *os = OverrideState::OverrideActive {
@@ -1360,7 +1346,7 @@ fn run_ui<C: MavConnection<MavMessage> + Send>(
                         }
                         _ => {}
                     }
-                    continue;
+                    continue 'ui;
                 }
                 if state.show_help_popup {
                     if matches!(key.code, KeyCode::Char('h') | KeyCode::Char('q') | KeyCode::Esc) {
@@ -1368,7 +1354,7 @@ fn run_ui<C: MavConnection<MavMessage> + Send>(
                     }
                 } else {
                 match key.code {
-                    KeyCode::Char('q') => break,
+                    KeyCode::Char('q') => break 'ui,
                     KeyCode::Char('h') => state.show_help_popup = true,
                     KeyCode::Char('a') => {
                         let ids = vehicle_ids_from_state(&state);
@@ -1529,35 +1515,35 @@ fn run_ui<C: MavConnection<MavMessage> + Send>(
                         // DO_REPOSITION uses MAV_FRAME_GLOBAL_RELATIVE_ALT so altitude must be relative to home, not AMSL.
                         if state.heartbeat_custom != Some(3) {
                             state.push_recent("Interrupt (i): switch to AUTO and start mission first.".to_string());
-                            continue;
+                            continue 'ui;
                         }
                         let (lat, lon, alt_rel) = match (state.lat, state.lon, state.alt, state.home_alt) {
                             (Some(la), Some(lo), Some(al), Some(home_al)) => (la, lo, al - home_al),
                             (Some(_), Some(_), None, _) | (None, _, _, _) | (_, None, _, _) => {
                                 state.push_recent("Interrupt: no position (need GPS).".to_string());
-                                continue;
+                                continue 'ui;
                             }
                             (_, _, Some(_), None) => {
                                 state.push_recent("Interrupt: need home position (wait for HOME_POSITION).".to_string());
-                                continue;
+                                continue 'ui;
                             }
                         };
                         let ok = {
                             let mut os = match override_state.lock() {
                                 Ok(g) => g,
-                                Err(_) => continue,
+                                Err(_) => continue 'ui,
                             };
                             if matches!(&*os, OverrideState::OverrideActive { .. }) {
                                 state.push_recent("Interrupt: finish current override first.".to_string());
-                                continue;
+                                continue 'ui;
                             }
                             let mut store = match mission_store.lock() {
                                 Ok(g) => g,
-                                Err(_) => continue,
+                                Err(_) => continue 'ui,
                             };
                             if !store.ensure_snapshot_for_pause() {
                                 state.push_recent("Interrupt: no mission or current WP (wait for mission download).".to_string());
-                                continue;
+                                continue 'ui;
                             }
                             *os = OverrideState::Paused;
                             true
@@ -1593,7 +1579,7 @@ fn run_ui<C: MavConnection<MavMessage> + Send>(
                         let (snapshot_items, resume_seq) = {
                             let store = match mission_store.lock() {
                                 Ok(g) => g,
-                                Err(_) => continue,
+                                Err(_) => continue 'ui,
                             };
                             match store.get_snapshot() {
                                 Some((items, seq)) => (items.to_vec(), seq),
@@ -1602,7 +1588,7 @@ fn run_ui<C: MavConnection<MavMessage> + Send>(
                                         override_state.lock().ok().map(|mut g| *g = OverrideState::MissionRunning);
                                         state.push_recent("Override cancelled (no snapshot). State reset.".to_string());
                                     }
-                                    continue;
+                                    continue 'ui;
                                 }
                             }
                         };
@@ -1632,8 +1618,30 @@ fn run_ui<C: MavConnection<MavMessage> + Send>(
                     _ => {}
                 }
                 }
+                }
+                Event::Resize(_, _) => {}
+                _ => {}
             }
         }
+
+        while let Ok(frame) = rx.try_recv() {
+            apply_message(&mut state, &frame);
+        }
+        while let Ok(line) = log_rx.try_recv() {
+            state.push_recent(line);
+        }
+        check_pending_feedback_timeout(&mut state);
+        if let Ok(ns) = net_watchdog_status.lock() {
+            let now = Instant::now();
+            state.net_online = ns.online;
+            state.net_secs_since_last_check =
+                ns.last_check.map(|t| now.duration_since(t).as_secs());
+            state.net_secs_since_last_ok = ns.last_ok.map(|t| now.duration_since(t).as_secs());
+            state.net_offline_secs = ns.offline_since.map(|t| now.duration_since(t).as_secs());
+            state.net_rtl_sent_for_current_outage = ns.rtl_sent_for_current_outage;
+        }
+        terminal.draw(|f| draw_ui(f, &state, &override_state, waypoint_input.as_deref()))?;
+        let _ = event::poll(Duration::from_millis(50))?;
     }
 
     crossterm::execute!(
