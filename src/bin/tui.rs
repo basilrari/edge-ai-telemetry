@@ -77,6 +77,48 @@ const RECENT_MESSAGES_MAX: usize = 32;
 /// After this, if there was no matching FC reply, show a hint once.
 const PENDING_CMD_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Re-send stream setup until these MAVLink messages have been seen at least once.
+const STREAM_AUTO_RETRY_FIRST_DELAY: Duration = Duration::from_millis(500);
+const STREAM_AUTO_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+const STREAM_AUTO_RETRY_MAX_ATTEMPTS: u32 = 35;
+
+/// Tracks which high-rate telemetry types we have received (recv thread).
+#[derive(Default)]
+struct TelemetryCoverage {
+    heartbeat: bool,
+    attitude: bool,
+    global_position_int: bool,
+    gps_raw_int: bool,
+    sys_status: bool,
+    vfr_hud: bool,
+    home_position: bool,
+}
+
+impl TelemetryCoverage {
+    fn update(&mut self, msg: &MavMessage) {
+        match msg {
+            MavMessage::HEARTBEAT(_) => self.heartbeat = true,
+            MavMessage::ATTITUDE(_) => self.attitude = true,
+            MavMessage::GLOBAL_POSITION_INT(_) => self.global_position_int = true,
+            MavMessage::GPS_RAW_INT(_) => self.gps_raw_int = true,
+            MavMessage::SYS_STATUS(_) => self.sys_status = true,
+            MavMessage::VFR_HUD(_) => self.vfr_hud = true,
+            MavMessage::HOME_POSITION(_) => self.home_position = true,
+            _ => {}
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        self.heartbeat
+            && self.attitude
+            && self.global_position_int
+            && self.gps_raw_int
+            && self.sys_status
+            && self.vfr_hud
+            && self.home_position
+    }
+}
+
 fn vehicle_ids_from_state(state: &TelemetryState) -> VehicleIds {
     VehicleIds::new(
         state.vehicle_sysid.unwrap_or(TARGET_SYSTEM),
@@ -568,6 +610,16 @@ fn request_stream_rates(connection: &impl MavConnection<MavMessage>, ids: Vehicl
     }
 }
 
+/// Re-request mission list and message intervals (same as first handshake).
+fn refresh_mavlink_streams(connection: &impl MavConnection<MavMessage>, ids: VehicleIds) {
+    let req = mavlink::ardupilotmega::MISSION_REQUEST_LIST_DATA {
+        target_system: ids.system_id,
+        target_component: ids.component_id,
+    };
+    let _ = connection.send_default(&MavMessage::MISSION_REQUEST_LIST(req));
+    request_stream_rates(connection, ids);
+}
+
 fn internet_is_reachable() -> bool {
     // Use raw IP endpoints so this check does not depend on DNS availability.
     const TARGETS: [&str; 3] = ["1.1.1.1:53", "8.8.8.8:53", "1.1.1.1:443"];
@@ -1038,7 +1090,7 @@ fn draw_ui(
             .collect()
     };
     let msg_block = Block::default()
-        .title(" Messages [1]=TUI sent [2]=FC reply [3]=no reply yet (h=help) ")
+        .title(" Messages [1]=TUI [2]=FC [3]=timeout | s=retry streams (h=help) ")
         .borders(Borders::ALL)
         .border_style(messages_style());
     f.render_widget(
@@ -1102,14 +1154,15 @@ fn draw_ui(
             Line::from(Span::styled("  r     RTL (return to launch)", Style::default().fg(help_fg))),
             Line::from(Span::styled("  l     Land", Style::default().fg(help_fg))),
             Line::from(Span::styled("  t     Takeoff 10 m", Style::default().fg(help_fg))),
+            Line::from(Span::styled("  s     Retry mission list + telemetry streams", Style::default().fg(help_fg))),
             Line::from(""),
             Line::from(Span::styled(" If arm fails: try g then a, or use f for force arm. ", Style::default().fg(Color::DarkGray))),
         ];
         let area = ratatui::layout::Rect {
             x: f.area().width.saturating_sub(52) / 2,
-            y: f.area().height.saturating_sub(18) / 2,
+            y: f.area().height.saturating_sub(20) / 2,
             width: 52.min(f.area().width),
-            height: 18.min(f.area().height),
+            height: 20.min(f.area().height),
         };
         f.render_widget(Clear, area);
         let block = Block::default()
@@ -1176,6 +1229,8 @@ fn horizontal_distance_m(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
 
 fn run_ui<C: MavConnection<MavMessage> + Send>(
     rx: mpsc::Receiver<MavFrame<MavMessage>>,
+    log_rx: mpsc::Receiver<String>,
+    stream_retry_tx: mpsc::Sender<()>,
     conn: Arc<Mutex<C>>,
     mission_store: Arc<Mutex<MissionStore>>,
     override_state: Arc<Mutex<OverrideState>>,
@@ -1195,6 +1250,9 @@ fn run_ui<C: MavConnection<MavMessage> + Send>(
     loop {
         while let Ok(frame) = rx.try_recv() {
             apply_message(&mut state, &frame);
+        }
+        while let Ok(line) = log_rx.try_recv() {
+            state.push_recent(line);
         }
         check_pending_feedback_timeout(&mut state);
         if let Ok(ns) = net_watchdog_status.lock() {
@@ -1406,6 +1464,9 @@ fn run_ui<C: MavConnection<MavMessage> + Send>(
                             );
                         }
                     }
+                    KeyCode::Char('s') => {
+                        let _ = stream_retry_tx.send(());
+                    }
                     KeyCode::Char('f') => {
                         let ids = vehicle_ids_from_state(&state);
                         if let Ok(mut c) = conn.lock() {
@@ -1612,6 +1673,8 @@ fn main() {
 
     let conn = Arc::new(Mutex::new(connection));
     let (tx, rx) = mpsc::channel();
+    let (log_tx, log_rx) = mpsc::channel::<String>();
+    let (stream_retry_tx, stream_retry_rx) = mpsc::channel::<()>();
     let mission_store = Arc::new(Mutex::new(MissionStore::new()));
     let override_state = Arc::new(Mutex::new(OverrideState::MissionRunning));
     let watchdog_vehicle_ids = Arc::new(Mutex::new(None::<VehicleIds>));
@@ -1623,26 +1686,81 @@ fn main() {
     let recv_watchdog_vehicle_ids = Arc::clone(&watchdog_vehicle_ids);
     let _recv_handle = thread::spawn(move || {
         let mut autopilot_handshake_done = false;
+        let mut stream_auto_spawned = false;
+        let coverage = Arc::new(Mutex::new(TelemetryCoverage::default()));
+        let vehicle_ids_for_retry = Arc::new(Mutex::new(VehicleIds::default()));
         let mut mission_count: Option<u16> = None;
         let mut vehicle_ids = VehicleIds::default();
         loop {
+            let mut manual_retry = false;
+            while stream_retry_rx.try_recv().is_ok() {
+                manual_retry = true;
+            }
+            if manual_retry {
+                let ids = *vehicle_ids_for_retry.lock().unwrap();
+                if let Ok(c) = recv_conn.lock() {
+                    refresh_mavlink_streams(&*c, ids);
+                    let _ = log_tx.send(
+                        "Streams: manual retry (mission list + stream rates).".to_string(),
+                    );
+                }
+            }
+
             let frame = match recv_conn.lock().unwrap().recv_frame() {
                 Ok(f) => f,
                 Err(_) => continue,
             };
+
+            if let Ok(mut cov) = coverage.lock() {
+                cov.update(&frame.msg);
+            }
+
             if !autopilot_handshake_done {
                 if let MavMessage::HEARTBEAT(d) = &frame.msg {
                     if heartbeat_from_autopilot(&frame, d.mavtype) {
                         autopilot_handshake_done = true;
                         vehicle_ids =
                             VehicleIds::new(frame.header.system_id, frame.header.component_id);
-                        let req = mavlink::ardupilotmega::MISSION_REQUEST_LIST_DATA {
-                            target_system: frame.header.system_id,
-                            target_component: frame.header.component_id,
-                        };
+                        *vehicle_ids_for_retry.lock().unwrap() = vehicle_ids;
                         let c = recv_conn.lock().unwrap();
-                        let _ = c.send_default(&MavMessage::MISSION_REQUEST_LIST(req));
-                        request_stream_rates(&*c, vehicle_ids);
+                        refresh_mavlink_streams(&*c, vehicle_ids);
+                        if !stream_auto_spawned {
+                            stream_auto_spawned = true;
+                            let conn = Arc::clone(&recv_conn);
+                            let cov = Arc::clone(&coverage);
+                            let vid = Arc::clone(&vehicle_ids_for_retry);
+                            let log = log_tx.clone();
+                            thread::spawn(move || {
+                                thread::sleep(STREAM_AUTO_RETRY_FIRST_DELAY);
+                                for attempt in 1..=STREAM_AUTO_RETRY_MAX_ATTEMPTS {
+                                    if cov.lock().unwrap().is_complete() {
+                                        let _ = log.send(
+                                            "Streams: telemetry complete (all key messages seen)."
+                                                .to_string(),
+                                        );
+                                        return;
+                                    }
+                                    let ids = *vid.lock().unwrap();
+                                    if let Ok(c) = conn.lock() {
+                                        refresh_mavlink_streams(&*c, ids);
+                                    }
+                                    if attempt == 1
+                                        || attempt % 5 == 0
+                                        || attempt == STREAM_AUTO_RETRY_MAX_ATTEMPTS
+                                    {
+                                        let _ = log.send(format!(
+                                            "Streams: auto-retry {}/{}…",
+                                            attempt, STREAM_AUTO_RETRY_MAX_ATTEMPTS
+                                        ));
+                                    }
+                                    thread::sleep(STREAM_AUTO_RETRY_INTERVAL);
+                                }
+                                let _ = log.send(
+                                    "Streams: auto-retry stopped (incomplete). Press s to retry."
+                                        .to_string(),
+                                );
+                            });
+                        }
                     }
                 }
             }
@@ -1650,6 +1768,7 @@ fn main() {
                 if heartbeat_from_autopilot(&frame, d.mavtype) {
                     let ids = VehicleIds::new(frame.header.system_id, frame.header.component_id);
                     vehicle_ids = ids;
+                    *vehicle_ids_for_retry.lock().unwrap() = vehicle_ids;
                     if let Ok(mut g) = recv_watchdog_vehicle_ids.lock() {
                         *g = Some(ids);
                     }
@@ -1853,7 +1972,15 @@ fn main() {
         }
     });
 
-    if let Err(e) = run_ui(rx, conn, mission_store, override_state, net_watchdog_status) {
+    if let Err(e) = run_ui(
+        rx,
+        log_rx,
+        stream_retry_tx,
+        conn,
+        mission_store,
+        override_state,
+        net_watchdog_status,
+    ) {
         eprintln!("UI error: {}", e);
         std::process::exit(1);
     }
