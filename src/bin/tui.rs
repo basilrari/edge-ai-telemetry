@@ -5,7 +5,6 @@
 use std::collections::VecDeque;
 use std::io;
 use std::net::{SocketAddr, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -18,7 +17,8 @@ use drone_server::{
 };
 use drone_server::mavlink_connect::{self, MavlinkArgsError};
 use mavlink::ardupilotmega::{
-    COMMAND_LONG_DATA, MavCmd, MavMessage, MavModeFlag, MavState, MavType, REQUEST_DATA_STREAM_DATA,
+    COMMAND_LONG_DATA, MavCmd, MavMessage, MavModeFlag, MavResult, MavState, MavType,
+    REQUEST_DATA_STREAM_DATA,
 };
 use mavlink::ardupilotmega::GpsFixType;
 use mavlink::{connect, MavConnection, MavFrame};
@@ -73,7 +73,91 @@ const MSG_ID_PARAM_VALUE: f32 = 22.0;
 const MSG_ID_COMMAND_ACK: f32 = 77.0;
 const MSG_ID_SYSTEM_TIME: f32 = 2.0;
 
-const RECENT_MESSAGES_MAX: usize = 24;
+const RECENT_MESSAGES_MAX: usize = 32;
+/// After this, if there was no matching FC reply, show a hint once.
+const PENDING_CMD_TIMEOUT: Duration = Duration::from_secs(3);
+
+fn vehicle_ids_from_state(state: &TelemetryState) -> VehicleIds {
+    VehicleIds::new(
+        state.vehicle_sysid.unwrap_or(TARGET_SYSTEM),
+        state.vehicle_compid.unwrap_or(TARGET_COMPONENT),
+    )
+}
+
+fn mav_result_desc(r: MavResult) -> String {
+    format!("{:?}", r)
+}
+
+/// Last command we sent from the TUI: used to correlate COMMAND_ACK and mode telemetry.
+#[derive(Clone)]
+struct PendingFeedback {
+    label: String,
+    /// COMMAND_ACK.command we expect for this action (if FC sends ACK).
+    expect_cmd: Option<MavCmd>,
+    /// ArduCopter `custom_mode` we expect on HEARTBEAT after SET_MODE / DO_SET_MODE (fallback).
+    expect_copter_mode: Option<u32>,
+    sent_at: Instant,
+    timeout_warned: bool,
+}
+
+impl PendingFeedback {
+    fn new(
+        label: impl Into<String>,
+        expect_cmd: Option<MavCmd>,
+        expect_copter_mode: Option<u32>,
+    ) -> Self {
+        Self {
+            label: label.into(),
+            expect_cmd,
+            expect_copter_mode,
+            sent_at: Instant::now(),
+            timeout_warned: false,
+        }
+    }
+}
+
+/// Log whether the MAVLink stack accepted the message for transmit; record pending FC feedback.
+fn log_outgoing<T>(
+    state: &mut TelemetryState,
+    pending: PendingFeedback,
+    send_result: Result<T, mavlink::error::MessageWriteError>,
+) {
+    match send_result.map(|_| ()) {
+        Ok(()) => {
+            state.push_recent(format!(
+                "[1] TUI → link: OK ({} queued for send)",
+                pending.label
+            ));
+            state.pending_feedback = Some(pending);
+        }
+        Err(e) => {
+            state.push_recent(format!(
+                "[1] TUI → link: FAILED ({}): {}",
+                pending.label, e
+            ));
+            state.pending_feedback = None;
+        }
+    }
+}
+
+/// Two-step send (e.g. mode then mission start): first leg must succeed before second.
+fn log_outgoing_two<T2>(
+    state: &mut TelemetryState,
+    label1: &str,
+    r1: Result<(), mavlink::error::MessageWriteError>,
+    pending2: PendingFeedback,
+    r2: Result<T2, mavlink::error::MessageWriteError>,
+) {
+    match r1 {
+        Ok(()) => state.push_recent(format!("[1] TUI → link: OK ({})", label1)),
+        Err(e) => {
+            state.push_recent(format!("[1] TUI → link: FAILED ({}): {}", label1, e));
+            state.pending_feedback = None;
+            return;
+        }
+    }
+    log_outgoing(state, pending2, r2);
+}
 
 fn rad_to_deg(rad: f32) -> f32 {
     rad.to_degrees()
@@ -289,6 +373,8 @@ struct TelemetryState {
     net_rtl_sent_for_current_outage: bool,
     /// When true, draw the help popup (h to toggle).
     pub show_help_popup: bool,
+    /// Last TUI command we are waiting to correlate with FC (COMMAND_ACK / mode).
+    pending_feedback: Option<PendingFeedback>,
 }
 
 impl TelemetryState {
@@ -300,11 +386,29 @@ impl TelemetryState {
     }
 }
 
+fn check_pending_feedback_timeout(state: &mut TelemetryState) {
+    let should_warn = match &state.pending_feedback {
+        Some(p) if !p.timeout_warned && p.sent_at.elapsed() >= PENDING_CMD_TIMEOUT => {
+            Some(p.label.clone())
+        }
+        _ => None,
+    };
+    if let Some(label) = should_warn {
+        if let Some(ref mut p) = state.pending_feedback {
+            p.timeout_warned = true;
+        }
+        state.push_recent(format!(
+            "[3] No FC reply yet for \"{}\" (no matching COMMAND_ACK / mode within {:?}). Check SYS/COMP in Vehicle, link, prearm, and other GCS.",
+            label, PENDING_CMD_TIMEOUT
+        ));
+    }
+}
+
 /// Set target_system and target_component on a COMMAND_LONG message.
-fn with_target(mut msg: MavMessage) -> MavMessage {
+fn with_vehicle(mut msg: MavMessage, ids: VehicleIds) -> MavMessage {
     if let MavMessage::COMMAND_LONG(ref mut d) = msg {
-        d.target_system = TARGET_SYSTEM;
-        d.target_component = TARGET_COMPONENT;
+        d.target_system = ids.system_id;
+        d.target_component = ids.component_id;
     }
     msg
 }
@@ -329,13 +433,16 @@ fn cmd_disarm() -> MavMessage {
     })
 }
 /// Send COMMAND_LONG mode change to GUIDED (ArduCopter custom_mode 4).
-fn cmd_set_mode_guided<C>(conn: &mut C) -> Result<(), mavlink::error::MessageWriteError>
+fn cmd_set_mode_guided_long<C>(
+    conn: &mut C,
+    ids: VehicleIds,
+) -> Result<(), mavlink::error::MessageWriteError>
 where
     C: MavConnection<MavMessage>,
 {
     let msg = MavMessage::COMMAND_LONG(COMMAND_LONG_DATA {
-        target_system: TARGET_SYSTEM,
-        target_component: TARGET_COMPONENT,
+        target_system: ids.system_id,
+        target_component: ids.component_id,
         command: MavCmd::MAV_CMD_DO_SET_MODE,
         confirmation: 0,
         param1: MODE_FLAG_CUSTOM_MODE_ENABLED,
@@ -350,13 +457,16 @@ where
 }
 
 /// Send COMMAND_LONG mode change to AUTO (ArduCopter custom_mode 3).
-fn cmd_set_mode_auto<C>(conn: &mut C) -> Result<(), mavlink::error::MessageWriteError>
+fn cmd_set_mode_auto_long<C>(
+    conn: &mut C,
+    ids: VehicleIds,
+) -> Result<(), mavlink::error::MessageWriteError>
 where
     C: MavConnection<MavMessage>,
 {
     let msg = MavMessage::COMMAND_LONG(COMMAND_LONG_DATA {
-        target_system: TARGET_SYSTEM,
-        target_component: TARGET_COMPONENT,
+        target_system: ids.system_id,
+        target_component: ids.component_id,
         command: MavCmd::MAV_CMD_DO_SET_MODE,
         confirmation: 0,
         param1: MODE_FLAG_CUSTOM_MODE_ENABLED,
@@ -378,10 +488,10 @@ fn cmd_takeoff_alt(altitude_m: f32) -> MavMessage {
     })
 }
 /// COMMAND_LONG to start the loaded waypoint mission (follow preloaded waypoints).
-fn cmd_mission_start() -> MavMessage {
+fn cmd_mission_start(ids: VehicleIds) -> MavMessage {
     MavMessage::COMMAND_LONG(COMMAND_LONG_DATA {
-        target_system: TARGET_SYSTEM,
-        target_component: TARGET_COMPONENT,
+        target_system: ids.system_id,
+        target_component: ids.component_id,
         command: MavCmd::MAV_CMD_MISSION_START,
         confirmation: 0,
         param1: 0.0,
@@ -500,6 +610,18 @@ fn apply_message(state: &mut TelemetryState, frame: &MavFrame<MavMessage>) {
             state.heartbeat_status = Some(mav_state_short(d.system_status).to_string());
             state.heartbeat_mode = Some(mav_mode_flags_short(d.base_mode));
             state.heartbeat_custom = Some(d.custom_mode);
+            // Fallback when COMMAND_ACK for DO_SET_MODE is missing: mode change still shows on stream.
+            if let Some(p) = state.pending_feedback.take() {
+                if p.expect_copter_mode == Some(d.custom_mode) {
+                    state.push_recent(format!(
+                        "[2] FC → telemetry: mode now {} ({})",
+                        arducopter_mode_name(d.custom_mode),
+                        p.label
+                    ));
+                } else {
+                    state.pending_feedback = Some(p);
+                }
+            }
         }
         MavMessage::ATTITUDE(d) => {
             state.roll = Some(rad_to_deg(d.roll));
@@ -572,13 +694,27 @@ fn apply_message(state: &mut TelemetryState, frame: &MavFrame<MavMessage>) {
             }
         }
         MavMessage::COMMAND_ACK(d) => {
-            let cmd_str = format!("{:?}", d.command);
-            let result_str = match d.result {
-                mavlink::ardupilotmega::MavResult::MAV_RESULT_ACCEPTED => "accepted",
-                _ => "failed",
+            let correlates = state
+                .pending_feedback
+                .as_ref()
+                .and_then(|p| p.expect_cmd)
+                .map(|c| c == d.command)
+                .unwrap_or(false);
+            let tag = if correlates {
+                "[2] FC → COMMAND_ACK (matches last TUI command)"
+            } else {
+                "[2] FC → COMMAND_ACK (other / not last TUI key)"
             };
-            state.push_recent(format!("ACK: {} {}", cmd_str, result_str));
-            if d.command == MavCmd::MAV_CMD_COMPONENT_ARM_DISARM && d.result != mavlink::ardupilotmega::MavResult::MAV_RESULT_ACCEPTED {
+            state.push_recent(format!(
+                "{} {:?} → {}",
+                tag,
+                d.command,
+                mav_result_desc(d.result)
+            ));
+            if correlates {
+                state.pending_feedback = None;
+            }
+            if d.command == MavCmd::MAV_CMD_COMPONENT_ARM_DISARM && d.result != MavResult::MAV_RESULT_ACCEPTED {
                 state.push_recent("Tip: press g for GUIDED then a to arm, or f for force arm".to_string());
             }
         }
@@ -902,7 +1038,7 @@ fn draw_ui(
             .collect()
     };
     let msg_block = Block::default()
-        .title(" Messages (h=help) ")
+        .title(" Messages [1]=TUI sent [2]=FC reply [3]=no reply yet (h=help) ")
         .borders(Borders::ALL)
         .border_style(messages_style());
     f.render_widget(
@@ -1060,6 +1196,7 @@ fn run_ui<C: MavConnection<MavMessage> + Send>(
         while let Ok(frame) = rx.try_recv() {
             apply_message(&mut state, &frame);
         }
+        check_pending_feedback_timeout(&mut state);
         if let Ok(ns) = net_watchdog_status.lock() {
             let now = Instant::now();
             state.net_online = ns.online;
@@ -1122,12 +1259,29 @@ fn run_ui<C: MavConnection<MavMessage> + Send>(
                                     state.vehicle_compid.unwrap_or(TARGET_COMPONENT),
                                 );
                                 if let Ok(mut c) = conn.lock() {
-                                    let _ = set_mode_guided(&mut *c, ids);
-                                    let _ = c.send_default(&goto_global_command_int(ids, lat, lon, alt));
+                                    let r1 = set_mode_guided(&mut *c, ids);
+                                    let r2 = c.send_default(&goto_global_command_int(ids, lat, lon, alt));
+                                    log_outgoing_two(
+                                        &mut state,
+                                        "GUIDED (SET_MODE)",
+                                        r1,
+                                        PendingFeedback::new(
+                                            "Override waypoint (DO_REPOSITION)",
+                                            Some(MavCmd::MAV_CMD_DO_REPOSITION),
+                                            None,
+                                        ),
+                                        r2,
+                                    );
                                     if resume_after {
-                                        state.push_recent(format!("Override: go to {:.5} {:.5} {:.0}m, then resume mission.", lat, lon, alt));
+                                        state.push_recent(format!(
+                                            "Override: go to {:.5} {:.5} {:.0}m, then resume mission.",
+                                            lat, lon, alt
+                                        ));
                                     } else {
-                                        state.push_recent(format!("Override: go to {:.5} {:.5} {:.0}m, then hover (c=resume).", lat, lon, alt));
+                                        state.push_recent(format!(
+                                            "Override: go to {:.5} {:.5} {:.0}m, then hover (c=resume).",
+                                            lat, lon, alt
+                                        ));
                                     }
                                 }
                             }
@@ -1159,62 +1313,139 @@ fn run_ui<C: MavConnection<MavMessage> + Send>(
                     KeyCode::Char('q') => break,
                     KeyCode::Char('h') => state.show_help_popup = true,
                     KeyCode::Char('a') => {
+                        let ids = vehicle_ids_from_state(&state);
                         if let Ok(c) = conn.lock() {
-                            let msg = with_target(cmd_arm());
-                            let _ = c.send_default(&msg);
-                            state.push_recent("Sent ARM.".to_string());
+                            let msg = with_vehicle(cmd_arm(), ids);
+                            log_outgoing(
+                                &mut state,
+                                PendingFeedback::new(
+                                    "ARM",
+                                    Some(MavCmd::MAV_CMD_COMPONENT_ARM_DISARM),
+                                    None,
+                                ),
+                                c.send_default(&msg),
+                            );
                         }
                     }
                     KeyCode::Char('d') => {
+                        let ids = vehicle_ids_from_state(&state);
                         if let Ok(c) = conn.lock() {
-                            let msg = with_target(cmd_disarm());
-                            let _ = c.send_default(&msg);
-                            state.push_recent("Sent DISARM.".to_string());
+                            let msg = with_vehicle(cmd_disarm(), ids);
+                            log_outgoing(
+                                &mut state,
+                                PendingFeedback::new(
+                                    "DISARM",
+                                    Some(MavCmd::MAV_CMD_COMPONENT_ARM_DISARM),
+                                    None,
+                                ),
+                                c.send_default(&msg),
+                            );
                         }
                     }
                     KeyCode::Char('g') => {
+                        let ids = vehicle_ids_from_state(&state);
                         if let Ok(mut c) = conn.lock() {
-                            let _ = cmd_set_mode_guided(&mut *c);
-                            state.push_recent("Sent GUIDED mode.".to_string());
+                            let r = cmd_set_mode_guided_long(&mut *c, ids);
+                            log_outgoing(
+                                &mut state,
+                                PendingFeedback::new(
+                                    "GUIDED (DO_SET_MODE)",
+                                    Some(MavCmd::MAV_CMD_DO_SET_MODE),
+                                    Some(4),
+                                ),
+                                r,
+                            );
                         }
                     }
                     KeyCode::Char('u') => {
+                        let ids = vehicle_ids_from_state(&state);
                         if let Ok(mut c) = conn.lock() {
-                            let _ = cmd_set_mode_auto(&mut *c);
-                            state.push_recent("Sent AUTO mode.".to_string());
+                            let r = cmd_set_mode_auto_long(&mut *c, ids);
+                            log_outgoing(
+                                &mut state,
+                                PendingFeedback::new(
+                                    "AUTO (DO_SET_MODE)",
+                                    Some(MavCmd::MAV_CMD_DO_SET_MODE),
+                                    Some(3),
+                                ),
+                                r,
+                            );
                         }
                     }
                     KeyCode::Char('m') => {
+                        let ids = vehicle_ids_from_state(&state);
                         if let Ok(mut c) = conn.lock() {
-                            let _ = cmd_set_mode_auto(&mut *c);
-                            let msg = with_target(cmd_mission_start());
-                            let _ = c.send_default(&msg);
-                            state.push_recent("Sent AUTO + Mission start (follow waypoints).".to_string());
+                            let r1 = cmd_set_mode_auto_long(&mut *c, ids);
+                            let msg = cmd_mission_start(ids);
+                            let r2 = c.send_default(&msg);
+                            log_outgoing_two(
+                                &mut state,
+                                "AUTO (DO_SET_MODE)",
+                                r1,
+                                PendingFeedback::new(
+                                    "MISSION_START",
+                                    Some(MavCmd::MAV_CMD_MISSION_START),
+                                    None,
+                                ),
+                                r2,
+                            );
                         }
                     }
                     KeyCode::Char('t') => {
+                        let ids = vehicle_ids_from_state(&state);
                         if let Ok(c) = conn.lock() {
-                            let msg = with_target(cmd_takeoff_alt(10.0));
-                            let _ = c.send_default(&msg);
-                            state.push_recent("Sent TAKEOFF 10m.".to_string());
+                            let msg = with_vehicle(cmd_takeoff_alt(10.0), ids);
+                            log_outgoing(
+                                &mut state,
+                                PendingFeedback::new(
+                                    "TAKEOFF 10m",
+                                    Some(MavCmd::MAV_CMD_NAV_TAKEOFF),
+                                    None,
+                                ),
+                                c.send_default(&msg),
+                            );
                         }
                     }
                     KeyCode::Char('f') => {
+                        let ids = vehicle_ids_from_state(&state);
                         if let Ok(mut c) = conn.lock() {
-                            let _ = force_arm(&mut *c, VehicleIds::default());
-                            state.push_recent("Sent FORCE_ARM.".to_string());
+                            log_outgoing(
+                                &mut state,
+                                PendingFeedback::new(
+                                    "FORCE_ARM",
+                                    Some(MavCmd::MAV_CMD_COMPONENT_ARM_DISARM),
+                                    None,
+                                ),
+                                force_arm(&mut *c, ids),
+                            );
                         }
                     }
                     KeyCode::Char('r') => {
+                        let ids = vehicle_ids_from_state(&state);
                         if let Ok(mut c) = conn.lock() {
-                            let _ = rtl(&mut *c, VehicleIds::default());
-                            state.push_recent("Sent RTL.".to_string());
+                            log_outgoing(
+                                &mut state,
+                                PendingFeedback::new(
+                                    "RTL",
+                                    Some(MavCmd::MAV_CMD_NAV_RETURN_TO_LAUNCH),
+                                    None,
+                                ),
+                                rtl(&mut *c, ids),
+                            );
                         }
                     }
                     KeyCode::Char('l') => {
+                        let ids = vehicle_ids_from_state(&state);
                         if let Ok(mut c) = conn.lock() {
-                            let _ = land(&mut *c, VehicleIds::default());
-                            state.push_recent("Sent LAND.".to_string());
+                            log_outgoing(
+                                &mut state,
+                                PendingFeedback::new(
+                                    "LAND",
+                                    Some(MavCmd::MAV_CMD_NAV_LAND),
+                                    None,
+                                ),
+                                land(&mut *c, ids),
+                            );
                         }
                     }
                     KeyCode::Char('w') => {
@@ -1276,9 +1507,23 @@ fn run_ui<C: MavConnection<MavMessage> + Send>(
                                 state.vehicle_compid.unwrap_or(TARGET_COMPONENT),
                             );
                             if let Ok(mut c) = conn.lock() {
-                                let _ = set_mode_guided(&mut *c, ids);
-                                let _ = c.send_default(&goto_global_command_int(ids, lat, lon, alt_rel));
-                                state.push_recent("Interrupt: hovering. Press c to resume mission, or w to inject waypoint.".to_string());
+                                let r1 = set_mode_guided(&mut *c, ids);
+                                let r2 = c.send_default(&goto_global_command_int(ids, lat, lon, alt_rel));
+                                log_outgoing_two(
+                                    &mut state,
+                                    "GUIDED (SET_MODE)",
+                                    r1,
+                                    PendingFeedback::new(
+                                        "Interrupt hover (DO_REPOSITION)",
+                                        Some(MavCmd::MAV_CMD_DO_REPOSITION),
+                                        None,
+                                    ),
+                                    r2,
+                                );
+                                state.push_recent(
+                                    "Interrupt: hovering. Press c to resume mission, or w to inject waypoint."
+                                        .to_string(),
+                                );
                             }
                         }
                     }
@@ -1370,14 +1615,12 @@ fn main() {
     let mission_store = Arc::new(Mutex::new(MissionStore::new()));
     let override_state = Arc::new(Mutex::new(OverrideState::MissionRunning));
     let watchdog_vehicle_ids = Arc::new(Mutex::new(None::<VehicleIds>));
-    let watchdog_armed = Arc::new(AtomicBool::new(false));
     let net_watchdog_status = Arc::new(Mutex::new(NetWatchdogStatus::default()));
 
     let recv_conn = Arc::clone(&conn);
     let recv_store = Arc::clone(&mission_store);
     let recv_override = Arc::clone(&override_state);
     let recv_watchdog_vehicle_ids = Arc::clone(&watchdog_vehicle_ids);
-    let recv_watchdog_armed = Arc::clone(&watchdog_armed);
     let _recv_handle = thread::spawn(move || {
         let mut autopilot_handshake_done = false;
         let mut mission_count: Option<u16> = None;
@@ -1410,7 +1653,6 @@ fn main() {
                     if let Ok(mut g) = recv_watchdog_vehicle_ids.lock() {
                         *g = Some(ids);
                     }
-                    recv_watchdog_armed.store(is_armed(d.base_mode), Ordering::Relaxed);
                 }
             }
 
@@ -1560,7 +1802,6 @@ fn main() {
 
     let watchdog_conn = Arc::clone(&conn);
     let watchdog_vehicle_ids_thread = Arc::clone(&watchdog_vehicle_ids);
-    let watchdog_armed_thread = Arc::clone(&watchdog_armed);
     let net_watchdog_status_thread = Arc::clone(&net_watchdog_status);
     let _net_watchdog_handle = thread::spawn(move || {
         loop {
@@ -1594,9 +1835,6 @@ fn main() {
                 continue;
             }
             if offline_elapsed < Duration::from_secs(INTERNET_OFFLINE_RTL_AFTER_SECS) {
-                continue;
-            }
-            if !watchdog_armed_thread.load(Ordering::Relaxed) {
                 continue;
             }
             let ids = match watchdog_vehicle_ids_thread.lock() {
