@@ -169,6 +169,12 @@ pub(crate) fn apply_message(state: &mut TelemetryState, frame: &MavFrame<MavMess
             let text = statustext_to_str(d);
             if !text.is_empty() {
                 state.push_recent(text.clone());
+                if text.contains("Missing Takeoff Cmd") {
+                    state.push_recent(
+                        "Tip: ArduCopter AUTO requires a mission NAV_TAKEOFF item before other mission waypoints."
+                            .to_string(),
+                    );
+                }
                 if text.starts_with("AP:") {
                     let rest = text.trim_start_matches("AP:").trim();
                     if rest.contains("ArduCopter")

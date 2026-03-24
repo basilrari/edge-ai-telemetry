@@ -303,14 +303,31 @@ pub(crate) fn draw_ui(
             .collect()
     };
     let msg_block = Block::default()
-        .title(" Messages [1]=TUI [2]=FC [3]=timeout | s=retry streams (h=help) ")
+        .title(" Messages [1]=TUI [2]=FC [3]=timeout | s=retry k=clear (h=help) ")
         .borders(Borders::ALL)
         .border_style(messages_style());
+    // Full messages panel height; log text only in the top 3/4 of the inner area (bottom 1/4 padding).
+    // Ratatui Ratio is fraction of whole: (3/4, 1/4), not weights 3:1.
+    let messages_area = right_chunks[1];
+    let msg_inner = msg_block.inner(messages_area);
+    let msg_inner_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Ratio(3, 4), Constraint::Ratio(1, 4)])
+        .split(msg_inner);
+    let text_area = msg_inner_chunks[0];
+    let msg_paragraph = Paragraph::new(msg_lines).wrap(Wrap { trim: true });
+    let total_lines = msg_paragraph.line_count(text_area.width.max(1));
+    let visible = text_area.height as usize;
+    let scroll_y = if visible == 0 {
+        0
+    } else {
+        total_lines.saturating_sub(visible)
+    };
+    let scroll_y = u16::try_from(scroll_y).unwrap_or(u16::MAX);
+    f.render_widget(&msg_block, messages_area);
     f.render_widget(
-        Paragraph::new(msg_lines)
-            .block(msg_block)
-            .wrap(Wrap { trim: true }),
-        right_chunks[1],
+        msg_paragraph.scroll((scroll_y, 0)),
+        text_area,
     );
 
     if let Some(buf) = waypoint_input {
@@ -400,6 +417,10 @@ pub(crate) fn draw_ui(
             Line::from(Span::styled("  t     Takeoff 10 m", Style::default().fg(help_fg))),
             Line::from(Span::styled(
                 "  s     Retry mission list + telemetry streams",
+                Style::default().fg(help_fg),
+            )),
+            Line::from(Span::styled(
+                "  k     Clear messages panel",
                 Style::default().fg(help_fg),
             )),
             Line::from(""),
