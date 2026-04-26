@@ -3,7 +3,7 @@
 //! Optional JSON **`params`** on `POST /v1/apply-tool` (same object the gateway forwards):
 //! - **`takeoff`**: `{"altitude_m": 10}` (default 10 m). Same as TUI **g** then **a** then **t** in one HTTP call:
 //!   `set_mode_guided_long`, `with_vehicle(arm())`, `with_vehicle(takeoff_alt(...))`.
-//! - **`mission_set_current`**: `{"seq": 0}` (required).
+//! - **`mission_set_current`**: `{"seq": 0}` (required) — sets **current mission item index** on the FC (`DO_SET_MISSION_CURRENT`); does not upload a mission or replace **`start_mission`** for “fly the mission”.
 //! - **`goto_location`**: `{"lat_deg":..,"lon_deg":..,"alt_m":..}` — `alt_m` is **relative to home**
 //!   (same convention as TUI interrupt / `COMMAND_INT` DO_REPOSITION).
 //! - **`mission_interrupt`**: pause AUTO mission and hold (TUI `i`); needs GPS + home + recv thread.
