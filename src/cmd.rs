@@ -1,34 +1,33 @@
 //! Helpers that build ArduPilotMega MAVLink command messages.
 
-#[allow(deprecated)]
-use mavlink::ardupilotmega::{
-    COMMAND_INT_DATA, COMMAND_LONG_DATA, MavCmd, MavFrame, MavMessage, MavMode, MavModeFlag,
-    SET_MODE_DATA,
-};
+use mavlink::ardupilotmega::{COMMAND_INT_DATA, COMMAND_LONG_DATA, MavCmd, MavFrame, MavMessage};
 use mavlink::MavConnection;
 
-fn base_mode_guided() -> u8 {
-    (MavModeFlag::MAV_MODE_FLAG_CUSTOM_MODE_ENABLED.bits()
-        | MavModeFlag::MAV_MODE_FLAG_MANUAL_INPUT_ENABLED.bits()
-        | MavModeFlag::MAV_MODE_FLAG_STABILIZE_ENABLED.bits()
-        | MavModeFlag::MAV_MODE_FLAG_GUIDED_ENABLED.bits()) as u8
-}
+/// `MAV_CMD_DO_SET_MODE` param1: select custom mode (ArduPilot convention).
+const MAV_MODE_FLAG_CUSTOM_MODE_ENABLED: f32 = 1.0;
 
-fn base_mode_auto() -> u8 {
-    (MavModeFlag::MAV_MODE_FLAG_CUSTOM_MODE_ENABLED.bits()
-        | MavModeFlag::MAV_MODE_FLAG_MANUAL_INPUT_ENABLED.bits()
-        | MavModeFlag::MAV_MODE_FLAG_STABILIZE_ENABLED.bits()
-        | MavModeFlag::MAV_MODE_FLAG_AUTO_ENABLED.bits()) as u8
-}
-
-fn to_set_mode_base_mode(base_mode: u8) -> MavMode {
-    match base_mode {
-        // 0b0101_1000 = custom + guided + stabilize + manual input.
-        89 => MavMode::MAV_MODE_GUIDED_DISARMED,
-        // 0b0101_1100 = custom + auto + stabilize + manual input.
-        93 => MavMode::MAV_MODE_AUTO_DISARMED,
-        _ => MavMode::MAV_MODE_PREFLIGHT,
-    }
+fn ardupilot_set_custom_mode<C>(
+    conn: &mut C,
+    ids: VehicleIds,
+    custom_mode: f32,
+) -> Result<(), mavlink::error::MessageWriteError>
+where
+    C: MavConnection<MavMessage>,
+{
+    let msg = MavMessage::COMMAND_LONG(COMMAND_LONG_DATA {
+        target_system: ids.system_id,
+        target_component: ids.component_id,
+        command: MavCmd::MAV_CMD_DO_SET_MODE,
+        confirmation: 0,
+        param1: MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+        param2: custom_mode,
+        param3: 0.0,
+        param4: 0.0,
+        param5: 0.0,
+        param6: 0.0,
+        param7: 0.0,
+    });
+    conn.send_default(&msg).map(|_| ())
 }
 
 /// ArduPilot Copter custom mode: Guided.
@@ -55,34 +54,23 @@ pub fn disarm() -> MavMessage {
     })
 }
 
-/// Set vehicle mode to Guided (ArduCopter custom_mode 4) via SET_MODE message.
-#[allow(deprecated)]
+/// Set vehicle mode to Guided (ArduCopter custom_mode 4) via `MAV_CMD_DO_SET_MODE` COMMAND_LONG.
+///
+/// Uses the same path as the field TUI (`DO_SET_MODE`), which reliably leaves modes such as RTL
+/// where `SET_MODE` alone is often ignored or delayed.
 pub fn set_mode_guided<C>(conn: &mut C, ids: VehicleIds) -> Result<(), mavlink::error::MessageWriteError>
 where
     C: MavConnection<MavMessage>,
 {
-    let base_mode = to_set_mode_base_mode(base_mode_guided());
-    let msg = MavMessage::SET_MODE(SET_MODE_DATA {
-        target_system: ids.system_id,
-        base_mode,
-        custom_mode: CUSTOM_MODE_GUIDED,
-    });
-    conn.send_default(&msg).map(|_| ())
+    ardupilot_set_custom_mode(conn, ids, CUSTOM_MODE_GUIDED as f32)
 }
 
-/// Set vehicle mode to Auto (ArduCopter custom_mode 3) via SET_MODE message.
-#[allow(deprecated)]
+/// Set vehicle mode to Auto (ArduCopter custom_mode 3) via `MAV_CMD_DO_SET_MODE` COMMAND_LONG.
 pub fn set_mode_auto<C>(conn: &mut C, ids: VehicleIds) -> Result<(), mavlink::error::MessageWriteError>
 where
     C: MavConnection<MavMessage>,
 {
-    let base_mode = to_set_mode_base_mode(base_mode_auto());
-    let msg = MavMessage::SET_MODE(SET_MODE_DATA {
-        target_system: ids.system_id,
-        base_mode,
-        custom_mode: CUSTOM_MODE_AUTO,
-    });
-    conn.send_default(&msg).map(|_| ())
+    ardupilot_set_custom_mode(conn, ids, CUSTOM_MODE_AUTO as f32)
 }
 
 /// Default takeoff altitude in meters when not specified.

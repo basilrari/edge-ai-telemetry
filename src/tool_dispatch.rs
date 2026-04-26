@@ -1,8 +1,8 @@
 //! Map LLM / gateway **drone** tool names to MAVLink sends (ArduCopter-oriented).
 //!
 //! Optional JSON **`params`** on `POST /v1/apply-tool` (same object the gateway forwards):
-//! - **`takeoff`**: `{"altitude_m": 10}` (default 10 m). Sends **GUIDED**, then **arm**, then **NAV_TAKEOFF**
-//!   so a single natural-language “take off” maps to one HTTP call without separate arm/mode steps.
+//! - **`takeoff`**: `{"altitude_m": 10}` (default 10 m). Sends **GUIDED** (`MAV_CMD_DO_SET_MODE`), short pause,
+//!   then **arm**, short pause, then **NAV_TAKEOFF** so the FC can leave RTL (or other non-armable modes) before arming.
 //! - **`mission_set_current`**: `{"seq": 0}` (required).
 //! - **`goto_location`**: `{"lat_deg":..,"lon_deg":..,"alt_m":..}` — `alt_m` is **relative to home**
 //!   (same convention as TUI interrupt / `COMMAND_INT` DO_REPOSITION).
@@ -160,10 +160,13 @@ where
         "takeoff" => {
             let alt = f32_param(&params, "altitude_m", DEFAULT_TAKEOFF_ALTITUDE_M);
             set_mode_guided(conn, ids).map_err(|e| e.to_string())?;
+            // Let the FC apply GUIDED (e.g. leave RTL) before arm — avoids "RTL mode not armable".
+            std::thread::sleep(std::time::Duration::from_millis(450));
             let arm_msg = set_command_long_targets(arm(), ids);
             conn.send_default(&arm_msg)
                 .map(|_| ())
                 .map_err(|e| e.to_string())?;
+            std::thread::sleep(std::time::Duration::from_millis(150));
             let msg = set_command_long_targets(takeoff_alt(alt), ids);
             conn.send_default(&msg).map(|_| ()).map_err(|e| e.to_string())
         }
