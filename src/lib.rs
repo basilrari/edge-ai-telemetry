@@ -1,8 +1,15 @@
 pub mod mission;
 pub mod cmd;
+pub mod geo;
+pub mod http_mission_tools;
+pub mod mavlink_http_runtime;
+pub mod mavlink_streams;
 pub mod mission_store;
 pub mod mavlink_connect;
 pub mod tool_dispatch;
+
+pub use geo::{horizontal_distance_m, parse_waypoint_input};
+pub use mavlink_streams::{heartbeat_from_autopilot, refresh_mavlink_streams, request_stream_rates};
 
 // Re-export command helpers for building MAVLink messages.
 pub use cmd::{

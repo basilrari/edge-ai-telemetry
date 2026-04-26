@@ -1,7 +1,7 @@
-//! Waypoint input parsing and geodesic helpers.
+//! Waypoint input parsing and geodesic helpers (shared by TUI and HTTP tools).
 
 /// Parse "lat lon alt" (three numbers) or "alt" (one number; uses current lat/lon).
-pub(crate) fn parse_waypoint_input(
+pub fn parse_waypoint_input(
     s: &str,
     current_lat: Option<f64>,
     current_lon: Option<f64>,
@@ -32,7 +32,8 @@ pub(crate) fn parse_waypoint_input(
     Ok((lat, lon, alt))
 }
 
-pub(crate) fn horizontal_distance_m(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+/// Great-circle distance in meters (WGS84 sphere).
+pub fn horizontal_distance_m(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
     let dlat = (lat2 - lat1).to_radians();
     let dlon = (lon2 - lon1).to_radians();
     let lat1_rad = lat1.to_radians();
@@ -43,5 +44,5 @@ pub(crate) fn horizontal_distance_m(lat1: f64, lon1: f64, lat2: f64, lon2: f64) 
     );
     let a = a.min(1.0).max(0.0);
     let c = 2.0 * (1.0 - a).sqrt().atan2(a.sqrt());
-    6371000.0 * c // Earth radius in meters
+    6371000.0 * c
 }

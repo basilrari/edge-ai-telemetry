@@ -4,7 +4,6 @@
 
 mod consts;
 mod format;
-mod geo;
 mod mavlink_cmd;
 mod recv;
 mod render;

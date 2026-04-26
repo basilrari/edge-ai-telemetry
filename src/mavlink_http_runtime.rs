@@ -1,65 +1,89 @@
-//! MAVLink receive thread: handshake, streams, mission sync, override progression.
+//! Background MAVLink receive loop for `drone-http`: mission mirror, resume handshake, override progression, telemetry cache.
 
-use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use drone_server::{
-    geo::horizontal_distance_m,
-    goto_global_command_int,
-    mavlink_streams::{heartbeat_from_autopilot, refresh_mavlink_streams},
-    mission_set_current, mission_start, set_mode_auto, MissionStore, VehicleIds,
+use crate::geo::horizontal_distance_m;
+use crate::mavlink_streams::{heartbeat_from_autopilot, refresh_mavlink_streams};
+use crate::{
+    goto_global_command_int, mission_set_current, mission_start, set_mode_auto, MissionStore,
+    VehicleIds,
 };
 use mavlink::ardupilotmega::MavMessage;
 use mavlink::{MavConnection, MavFrame};
 
-use crate::consts::{
-    REACHED_THRESHOLD_M, STREAM_AUTO_RETRY_FIRST_DELAY, STREAM_AUTO_RETRY_INTERVAL,
-    STREAM_AUTO_RETRY_MAX_ATTEMPTS,
-};
-use crate::state::{OverrideState, TelemetryCoverage};
+/// Horizontal distance (m) to consider a waypoint reached (same as TUI).
+const REACHED_THRESHOLD_M: f64 = 10.0;
 
-pub(crate) fn spawn_recv_thread<C>(
+/// Same states as the TUI override/mission-resume state machine (HTTP path has no UI channel).
+#[derive(Clone, Debug)]
+pub enum HttpOverrideState {
+    MissionRunning,
+    Paused,
+    OverrideActive {
+        waypoints: Vec<(f64, f64, f64)>,
+        index: usize,
+        resume_after: bool,
+    },
+    Resuming { resume_seq: u16 },
+}
+
+impl Default for HttpOverrideState {
+    fn default() -> Self {
+        Self::MissionRunning
+    }
+}
+
+/// Latest position / mode for HTTP tools (`mission_interrupt`, `waypoint_inject` text parsing).
+#[derive(Default)]
+pub struct TelemetryCache {
+    pub lat: Option<f64>,
+    pub lon: Option<f64>,
+    pub alt_amsl_m: Option<f64>,
+    pub home_alt_m: Option<f64>,
+    pub heartbeat_custom_mode: Option<u32>,
+}
+
+fn telem_update_from_frame(cache: &mut TelemetryCache, frame: &MavFrame<MavMessage>) {
+    match &frame.msg {
+        MavMessage::HEARTBEAT(d) if heartbeat_from_autopilot(frame, d.mavtype) => {
+            cache.heartbeat_custom_mode = Some(d.custom_mode);
+        }
+        MavMessage::GLOBAL_POSITION_INT(d) => {
+            cache.lat = Some(d.lat as f64 / 1e7);
+            cache.lon = Some(d.lon as f64 / 1e7);
+            cache.alt_amsl_m = Some(d.alt as f64 / 1000.0);
+        }
+        MavMessage::HOME_POSITION(d) => {
+            cache.home_alt_m = Some(d.altitude as f64 / 1000.0);
+        }
+        _ => {}
+    }
+}
+
+pub fn spawn_http_mavlink_recv_thread<C>(
     recv_conn: Arc<Mutex<C>>,
     recv_store: Arc<Mutex<MissionStore>>,
-    recv_override: Arc<Mutex<OverrideState>>,
-    recv_watchdog_vehicle_ids: Arc<Mutex<Option<VehicleIds>>>,
-    tx: mpsc::Sender<MavFrame<MavMessage>>,
-    log_tx: mpsc::Sender<String>,
-    stream_retry_rx: mpsc::Receiver<()>,
+    recv_override: Arc<Mutex<HttpOverrideState>>,
+    recv_telem: Arc<Mutex<TelemetryCache>>,
+    recv_vehicle_ids: Arc<Mutex<VehicleIds>>,
 ) -> thread::JoinHandle<()>
 where
     C: MavConnection<MavMessage> + Send + 'static,
 {
     thread::spawn(move || {
         let mut autopilot_handshake_done = false;
-        let mut stream_auto_spawned = false;
-        let coverage = Arc::new(Mutex::new(TelemetryCoverage::default()));
-        let vehicle_ids_for_retry = Arc::new(Mutex::new(VehicleIds::default()));
         let mut mission_count: Option<u16> = None;
         let mut vehicle_ids = VehicleIds::default();
-        loop {
-            let mut manual_retry = false;
-            while stream_retry_rx.try_recv().is_ok() {
-                manual_retry = true;
-            }
-            if manual_retry {
-                let ids = *vehicle_ids_for_retry.lock().unwrap();
-                if let Ok(c) = recv_conn.lock() {
-                    refresh_mavlink_streams(&*c, ids);
-                    let _ = log_tx.send(
-                        "Streams: manual retry (mission list + stream rates).".to_string(),
-                    );
-                }
-            }
 
+        loop {
             let frame = match recv_conn.lock().unwrap().recv_frame() {
                 Ok(f) => f,
                 Err(_) => continue,
             };
 
-            if let Ok(mut cov) = coverage.lock() {
-                cov.update(&frame.msg);
+            if let Ok(mut t) = recv_telem.lock() {
+                telem_update_from_frame(&mut t, &frame);
             }
 
             if !autopilot_handshake_done {
@@ -68,61 +92,25 @@ where
                         autopilot_handshake_done = true;
                         vehicle_ids =
                             VehicleIds::new(frame.header.system_id, frame.header.component_id);
-                        *vehicle_ids_for_retry.lock().unwrap() = vehicle_ids;
-                        let c = recv_conn.lock().unwrap();
-                        refresh_mavlink_streams(&*c, vehicle_ids);
-                        if !stream_auto_spawned {
-                            stream_auto_spawned = true;
-                            let conn = Arc::clone(&recv_conn);
-                            let cov = Arc::clone(&coverage);
-                            let vid = Arc::clone(&vehicle_ids_for_retry);
-                            let log = log_tx.clone();
-                            thread::spawn(move || {
-                                thread::sleep(STREAM_AUTO_RETRY_FIRST_DELAY);
-                                for attempt in 1..=STREAM_AUTO_RETRY_MAX_ATTEMPTS {
-                                    if cov.lock().unwrap().is_complete() {
-                                        let _ = log.send(
-                                            "Streams: telemetry complete (all key messages seen)."
-                                                .to_string(),
-                                        );
-                                        return;
-                                    }
-                                    let ids = *vid.lock().unwrap();
-                                    if let Ok(c) = conn.lock() {
-                                        refresh_mavlink_streams(&*c, ids);
-                                    }
-                                    if attempt == 1
-                                        || attempt % 5 == 0
-                                        || attempt == STREAM_AUTO_RETRY_MAX_ATTEMPTS
-                                    {
-                                        let _ = log.send(format!(
-                                            "Streams: auto-retry {}/{}…",
-                                            attempt, STREAM_AUTO_RETRY_MAX_ATTEMPTS
-                                        ));
-                                    }
-                                    thread::sleep(STREAM_AUTO_RETRY_INTERVAL);
-                                }
-                                let _ = log.send(
-                                    "Streams: auto-retry stopped (incomplete). Press s to retry."
-                                        .to_string(),
-                                );
-                            });
+                        if let Ok(mut g) = recv_vehicle_ids.lock() {
+                            *g = vehicle_ids;
+                        }
+                        if let Ok(c) = recv_conn.lock() {
+                            refresh_mavlink_streams(&*c, vehicle_ids);
                         }
                     }
                 }
             }
+
             if let MavMessage::HEARTBEAT(d) = &frame.msg {
                 if heartbeat_from_autopilot(&frame, d.mavtype) {
-                    let ids = VehicleIds::new(frame.header.system_id, frame.header.component_id);
-                    vehicle_ids = ids;
-                    *vehicle_ids_for_retry.lock().unwrap() = vehicle_ids;
-                    if let Ok(mut g) = recv_watchdog_vehicle_ids.lock() {
-                        *g = Some(ids);
+                    vehicle_ids = VehicleIds::new(frame.header.system_id, frame.header.component_id);
+                    if let Ok(mut g) = recv_vehicle_ids.lock() {
+                        *g = vehicle_ids;
                     }
                 }
             }
 
-            // Update mission store from FC
             if let MavMessage::MISSION_ITEM_INT(d) = &frame.msg {
                 if let Ok(mut store) = recv_store.lock() {
                     store.update_from_item(d);
@@ -152,7 +140,6 @@ where
                 }
             }
 
-            // Upload handshake: FC requested an item during our upload
             if let MavMessage::MISSION_REQUEST_INT(d) = &frame.msg {
                 if let (Ok(mut store), Ok(conn_lock)) = (recv_store.lock(), recv_conn.lock()) {
                     if let Some(mut item) = store.take_upload_item(d.seq) {
@@ -162,12 +149,12 @@ where
                     }
                 }
             }
+
             if let MavMessage::MISSION_ACK(_) = &frame.msg {
-                let resume_seq = if let Ok(state) = recv_override.lock() {
-                    if let OverrideState::Resuming { resume_seq } = *state {
-                        Some(resume_seq)
-                    } else {
-                        None
+                let resume_seq = if let Ok(guard) = recv_override.lock() {
+                    match &*guard {
+                        HttpOverrideState::Resuming { resume_seq } => Some(*resume_seq),
+                        _ => None,
                     }
                 } else {
                     None
@@ -181,14 +168,12 @@ where
                         let _ = set_mode_auto(&mut *conn_lock, vehicle_ids);
                         let _ = mission_start(&mut *conn_lock, vehicle_ids);
                     }
-                    // Keep snapshot so multiple interrupts/waypoint injections work in the same session
                     if let Ok(mut state) = recv_override.lock() {
-                        *state = OverrideState::MissionRunning;
+                        *state = HttpOverrideState::MissionRunning;
                     }
                 }
             }
 
-            // Override: check if we reached current override waypoint
             if let MavMessage::GLOBAL_POSITION_INT(d) = &frame.msg {
                 let lat = d.lat as f64 / 1e7;
                 let lon = d.lon as f64 / 1e7;
@@ -196,7 +181,7 @@ where
                     Ok(g) => g,
                     Err(_) => continue,
                 };
-                if let OverrideState::OverrideActive {
+                if let HttpOverrideState::OverrideActive {
                     waypoints,
                     index,
                     resume_after,
@@ -209,7 +194,6 @@ where
                             *index += 1;
                             if *index >= waypoints.len() {
                                 if *resume_after {
-                                    // Override done -> start resume mission
                                     let (snapshot_items, resume_seq) = {
                                         let store = match recv_store.lock() {
                                             Ok(s) => s,
@@ -234,13 +218,12 @@ where
                                         },
                                     ));
                                     if let Ok(mut st) = recv_override.lock() {
-                                        *st = OverrideState::Resuming { resume_seq };
+                                        *st = HttpOverrideState::Resuming { resume_seq };
                                     }
                                 } else {
-                                    // Override done -> stay paused (hover at this position)
                                     drop(state_guard);
                                     if let Ok(mut st) = recv_override.lock() {
-                                        *st = OverrideState::Paused;
+                                        *st = HttpOverrideState::Paused;
                                     }
                                 }
                             } else {
@@ -277,8 +260,6 @@ where
                     }
                 }
             }
-
-            let _ = tx.send(frame);
         }
     })
 }

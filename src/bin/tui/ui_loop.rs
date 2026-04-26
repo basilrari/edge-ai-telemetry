@@ -14,7 +14,7 @@ use mavlink::{MavConnection, MavFrame};
 use ratatui::Terminal;
 
 use crate::consts::{TARGET_COMPONENT, TARGET_SYSTEM};
-use crate::geo::parse_waypoint_input;
+use drone_server::geo::parse_waypoint_input;
 use crate::mavlink_cmd::{
     cmd_arm, cmd_disarm, cmd_mission_start, cmd_set_mode_auto_long, cmd_set_mode_guided_long,
     cmd_takeoff_alt, with_vehicle,
