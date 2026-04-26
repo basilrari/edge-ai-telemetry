@@ -161,7 +161,7 @@ where
             conn.send_default(&msg).map(|_| ()).map_err(|e| e.to_string())
         }
         "start_mission" => {
-            // TUI `m`: AUTO then MISSION_START (no local mission validation; FC may reject).
+            // TUI `m`: AUTO then MISSION_START. `drone-http` runs [`MissionStore::validate_ready_for_start_mission`] first (same rules as TUI before send).
             set_mode_auto(conn, ids)
                 .map_err(|e| e.to_string())
                 .and_then(|_| mission_start(conn, ids).map_err(|e| e.to_string()))

@@ -1,7 +1,7 @@
 //! Mission store: holds the current mission from the FC and a snapshot for override/resume.
 
 #[allow(deprecated)]
-use mavlink::ardupilotmega::MISSION_ITEM_INT_DATA;
+use mavlink::ardupilotmega::{MavCmd, MISSION_ITEM_INT_DATA};
 
 /// Stored mission item for re-upload (clone of MAVLink MISSION_ITEM_INT).
 pub type StoredMissionItem = MISSION_ITEM_INT_DATA;
@@ -112,5 +112,26 @@ impl MissionStore {
     /// Get snapshot for resume. Returns (items, current_seq) if present.
     pub fn get_snapshot(&self) -> Option<(&[StoredMissionItem], u16)> {
         self.snapshot.as_ref().map(|(a, b)| (a.as_slice(), *b))
+    }
+
+    /// Same checks as TUI **`m`** before AUTO + MISSION_START: mission downloaded and includes NAV_TAKEOFF.
+    pub fn validate_ready_for_start_mission(&self) -> Result<(), String> {
+        if self.items.is_empty() {
+            return Err(
+                "start_mission: no mission downloaded on this link yet (wait for MISSION_ITEM_INT after connect, or upload in QGC/Mission Planner). TUI shows: \"Mission start blocked: no mission downloaded yet\"."
+                    .to_string(),
+            );
+        }
+        let has_takeoff = self
+            .items
+            .iter()
+            .any(|it| it.command == MavCmd::MAV_CMD_NAV_TAKEOFF);
+        if !has_takeoff {
+            return Err(format!(
+                "start_mission: loaded mission has {} item(s) but no NAV_TAKEOFF (ArduCopter AUTO needs a TAKEOFF item first). TUI shows the same block for key m.",
+                self.items.len()
+            ));
+        }
+        Ok(())
     }
 }
