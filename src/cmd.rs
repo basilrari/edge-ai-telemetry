@@ -54,23 +54,45 @@ pub fn disarm() -> MavMessage {
     })
 }
 
-/// Set vehicle mode to Guided (ArduCopter custom_mode 4) via `MAV_CMD_DO_SET_MODE` COMMAND_LONG.
-///
-/// Uses the same path as the field TUI (`DO_SET_MODE`), which reliably leaves modes such as RTL
-/// where `SET_MODE` alone is often ignored or delayed.
-pub fn set_mode_guided<C>(conn: &mut C, ids: VehicleIds) -> Result<(), mavlink::error::MessageWriteError>
+/// Stamp `target_system` / `target_component` on a COMMAND_LONG (TUI `with_vehicle`).
+pub fn with_vehicle(mut msg: MavMessage, ids: VehicleIds) -> MavMessage {
+    if let MavMessage::COMMAND_LONG(ref mut d) = msg {
+        d.target_system = ids.system_id;
+        d.target_component = ids.component_id;
+    }
+    msg
+}
+
+/// TUI `g`: `MAV_CMD_DO_SET_MODE` → ArduCopter GUIDED (custom mode 4).
+pub fn set_mode_guided_long<C>(conn: &mut C, ids: VehicleIds) -> Result<(), mavlink::error::MessageWriteError>
 where
     C: MavConnection<MavMessage>,
 {
     ardupilot_set_custom_mode(conn, ids, CUSTOM_MODE_GUIDED as f32)
 }
 
-/// Set vehicle mode to Auto (ArduCopter custom_mode 3) via `MAV_CMD_DO_SET_MODE` COMMAND_LONG.
-pub fn set_mode_auto<C>(conn: &mut C, ids: VehicleIds) -> Result<(), mavlink::error::MessageWriteError>
+/// TUI `u`: `MAV_CMD_DO_SET_MODE` → ArduCopter AUTO (custom mode 3).
+pub fn set_mode_auto_long<C>(conn: &mut C, ids: VehicleIds) -> Result<(), mavlink::error::MessageWriteError>
 where
     C: MavConnection<MavMessage>,
 {
     ardupilot_set_custom_mode(conn, ids, CUSTOM_MODE_AUTO as f32)
+}
+
+/// Same as [`set_mode_guided_long`] (HTTP tools and interrupt path use this name).
+pub fn set_mode_guided<C>(conn: &mut C, ids: VehicleIds) -> Result<(), mavlink::error::MessageWriteError>
+where
+    C: MavConnection<MavMessage>,
+{
+    set_mode_guided_long(conn, ids)
+}
+
+/// Same as [`set_mode_auto_long`].
+pub fn set_mode_auto<C>(conn: &mut C, ids: VehicleIds) -> Result<(), mavlink::error::MessageWriteError>
+where
+    C: MavConnection<MavMessage>,
+{
+    set_mode_auto_long(conn, ids)
 }
 
 /// Default takeoff altitude in meters when not specified.
@@ -244,12 +266,9 @@ where
     conn.send_default(&msg).map(|_| ())
 }
 
-/// Start mission execution (MAV_CMD_MISSION_START). Call after set_mode_auto and mission_set_current when resuming.
-pub fn mission_start<C>(conn: &mut C, ids: VehicleIds) -> Result<(), mavlink::error::MessageWriteError>
-where
-    C: MavConnection<MavMessage>,
-{
-    let msg = MavMessage::COMMAND_LONG(COMMAND_LONG_DATA {
+/// MAV_CMD_MISSION_START as a message (TUI `m` after AUTO).
+pub fn mission_start_message(ids: VehicleIds) -> MavMessage {
+    MavMessage::COMMAND_LONG(COMMAND_LONG_DATA {
         target_system: ids.system_id,
         target_component: ids.component_id,
         command: MavCmd::MAV_CMD_MISSION_START,
@@ -262,6 +281,13 @@ where
         param6: 0.0,
         param7: 0.0,
         ..COMMAND_LONG_DATA::default()
-    });
-    conn.send_default(&msg).map(|_| ())
+    })
+}
+
+/// Start mission execution (MAV_CMD_MISSION_START). Call after set_mode_auto and mission_set_current when resuming.
+pub fn mission_start<C>(conn: &mut C, ids: VehicleIds) -> Result<(), mavlink::error::MessageWriteError>
+where
+    C: MavConnection<MavMessage>,
+{
+    conn.send_default(&mission_start_message(ids)).map(|_| ())
 }

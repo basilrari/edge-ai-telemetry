@@ -1,8 +1,8 @@
 //! Map LLM / gateway **drone** tool names to MAVLink sends (ArduCopter-oriented).
 //!
 //! Optional JSON **`params`** on `POST /v1/apply-tool` (same object the gateway forwards):
-//! - **`takeoff`**: `{"altitude_m": 10}` (default 10 m). Sends **GUIDED** (`MAV_CMD_DO_SET_MODE`), short pause,
-//!   then **arm**, short pause, then **NAV_TAKEOFF** so the FC can leave RTL (or other non-armable modes) before arming.
+//! - **`takeoff`**: `{"altitude_m": 10}` (default 10 m). Same as TUI **g** then **a** then **t** in one HTTP call:
+//!   `set_mode_guided_long`, `with_vehicle(arm())`, `with_vehicle(takeoff_alt(...))`.
 //! - **`mission_set_current`**: `{"seq": 0}` (required).
 //! - **`goto_location`**: `{"lat_deg":..,"lon_deg":..,"alt_m":..}` — `alt_m` is **relative to home**
 //!   (same convention as TUI interrupt / `COMMAND_INT` DO_REPOSITION).
@@ -15,7 +15,8 @@
 
 use crate::{
     arm, disarm, force_arm, goto_global_command_int, land, mission_set_current, mission_start, rtl,
-    set_mode_auto, set_mode_guided, takeoff_alt, VehicleIds, DEFAULT_TAKEOFF_ALTITUDE_M,
+    set_mode_auto, set_mode_guided, set_mode_guided_long, takeoff_alt, with_vehicle, VehicleIds,
+    DEFAULT_TAKEOFF_ALTITUDE_M,
 };
 use mavlink::ardupilotmega::{
     COMMAND_LONG_DATA, MavCmd, MavFrame, MavMessage, MavType, PositionTargetTypemask,
@@ -48,14 +49,6 @@ pub const LLM_DRONE_TOOL_NAMES: &[&str] = &[
 
 const MODE_FLAG_CUSTOM_MODE_ENABLED: f32 = 1.0;
 const ARDUCOPTER_MODE_CIRCLE: f32 = 7.0;
-
-fn set_command_long_targets(mut msg: MavMessage, ids: VehicleIds) -> MavMessage {
-    if let MavMessage::COMMAND_LONG(ref mut d) = msg {
-        d.target_system = ids.system_id;
-        d.target_component = ids.component_id;
-    }
-    msg
-}
 
 fn set_arducopter_mode_long<C>(
     conn: &mut C,
@@ -147,27 +140,24 @@ where
 
     match tool {
         "arm" => {
-            let msg = set_command_long_targets(arm(), ids);
+            let msg = with_vehicle(arm(), ids);
             conn.send_default(&msg).map(|_| ()).map_err(|e| e.to_string())
         }
         "disarm" => {
-            let msg = set_command_long_targets(disarm(), ids);
+            let msg = with_vehicle(disarm(), ids);
             conn.send_default(&msg).map(|_| ()).map_err(|e| e.to_string())
         }
         "force_arm" => force_arm(conn, ids).map_err(|e| e.to_string()),
         "set_mode_auto" => set_mode_auto(conn, ids).map_err(|e| e.to_string()),
-        "set_mode_guided" | "hover" => set_mode_guided(conn, ids).map_err(|e| e.to_string()),
+        "set_mode_guided" | "hover" => set_mode_guided_long(conn, ids).map_err(|e| e.to_string()),
         "takeoff" => {
             let alt = f32_param(&params, "altitude_m", DEFAULT_TAKEOFF_ALTITUDE_M);
-            set_mode_guided(conn, ids).map_err(|e| e.to_string())?;
-            // Let the FC apply GUIDED (e.g. leave RTL) before arm — avoids "RTL mode not armable".
-            std::thread::sleep(std::time::Duration::from_millis(450));
-            let arm_msg = set_command_long_targets(arm(), ids);
+            set_mode_guided_long(conn, ids).map_err(|e| e.to_string())?;
+            let arm_msg = with_vehicle(arm(), ids);
             conn.send_default(&arm_msg)
                 .map(|_| ())
                 .map_err(|e| e.to_string())?;
-            std::thread::sleep(std::time::Duration::from_millis(150));
-            let msg = set_command_long_targets(takeoff_alt(alt), ids);
+            let msg = with_vehicle(takeoff_alt(alt), ids);
             conn.send_default(&msg).map(|_| ()).map_err(|e| e.to_string())
         }
         "start_mission" => {
