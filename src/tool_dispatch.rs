@@ -1,7 +1,8 @@
 //! Map LLM / gateway **drone** tool names to MAVLink sends (ArduCopter-oriented).
 //!
 //! Optional JSON **`params`** on `POST /v1/apply-tool` (same object the gateway forwards):
-//! - **`takeoff`**: `{"altitude_m": 10}` (default 10 m, matches TUI `t`).
+//! - **`takeoff`**: `{"altitude_m": 10}` (default 10 m). Sends **GUIDED**, then **arm**, then **NAV_TAKEOFF**
+//!   so a single natural-language “take off” maps to one HTTP call without separate arm/mode steps.
 //! - **`mission_set_current`**: `{"seq": 0}` (required).
 //! - **`goto_location`**: `{"lat_deg":..,"lon_deg":..,"alt_m":..}` — `alt_m` is **relative to home**
 //!   (same convention as TUI interrupt / `COMMAND_INT` DO_REPOSITION).
@@ -158,6 +159,11 @@ where
         "set_mode_guided" | "hover" => set_mode_guided(conn, ids).map_err(|e| e.to_string()),
         "takeoff" => {
             let alt = f32_param(&params, "altitude_m", DEFAULT_TAKEOFF_ALTITUDE_M);
+            set_mode_guided(conn, ids).map_err(|e| e.to_string())?;
+            let arm_msg = set_command_long_targets(arm(), ids);
+            conn.send_default(&arm_msg)
+                .map(|_| ())
+                .map_err(|e| e.to_string())?;
             let msg = set_command_long_targets(takeoff_alt(alt), ids);
             conn.send_default(&msg).map(|_| ()).map_err(|e| e.to_string())
         }
