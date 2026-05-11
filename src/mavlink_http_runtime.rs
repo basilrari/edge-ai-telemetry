@@ -9,7 +9,7 @@ use crate::{
     goto_global_command_int, mission_set_current, mission_start, set_mode_auto, MissionStore,
     VehicleIds,
 };
-use mavlink::ardupilotmega::MavMessage;
+use mavlink::ardupilotmega::{MavMessage, MavModeFlag};
 use mavlink::{MavConnection, MavFrame};
 
 /// Horizontal distance (m) to consider a waypoint reached (same as TUI).
@@ -42,17 +42,26 @@ pub struct TelemetryCache {
     pub alt_amsl_m: Option<f64>,
     pub home_alt_m: Option<f64>,
     pub heartbeat_custom_mode: Option<u32>,
+    /// From HEARTBEAT `base_mode` (autopilot only).
+    pub armed: Option<bool>,
+    /// From GLOBAL_POSITION_INT `relative_alt` (meters above home).
+    pub relative_alt_m: Option<f64>,
 }
 
 fn telem_update_from_frame(cache: &mut TelemetryCache, frame: &MavFrame<MavMessage>) {
     match &frame.msg {
         MavMessage::HEARTBEAT(d) if heartbeat_from_autopilot(frame, d.mavtype) => {
             cache.heartbeat_custom_mode = Some(d.custom_mode);
+            cache.armed = Some(
+                d.base_mode
+                    .contains(MavModeFlag::MAV_MODE_FLAG_SAFETY_ARMED),
+            );
         }
         MavMessage::GLOBAL_POSITION_INT(d) => {
             cache.lat = Some(d.lat as f64 / 1e7);
             cache.lon = Some(d.lon as f64 / 1e7);
             cache.alt_amsl_m = Some(d.alt as f64 / 1000.0);
+            cache.relative_alt_m = Some(d.relative_alt as f64 / 1000.0);
         }
         MavMessage::HOME_POSITION(d) => {
             cache.home_alt_m = Some(d.altitude as f64 / 1000.0);

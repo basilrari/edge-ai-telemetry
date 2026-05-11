@@ -5,10 +5,14 @@
 //!   `set_mode_guided_long`, `with_vehicle(arm())`, `with_vehicle(takeoff_alt(...))`.
 //! - **`mission_set_current`**: `{"seq": 0}` (required) — sets **current mission item index** on the FC (`DO_SET_MISSION_CURRENT`); does not upload a mission or replace **`start_mission`** for “fly the mission”.
 //! - **`goto_location`**: `{"lat_deg":..,"lon_deg":..,"alt_m":..}` — `alt_m` is **relative to home**
-//!   (same convention as TUI interrupt / `COMMAND_INT` DO_REPOSITION).
+//!   (same convention as TUI interrupt / `COMMAND_INT` DO_REPOSITION). If the vehicle is **disarmed**
+//!   or **on the ground** (low relative altitude), **drone-http** runs **`takeoff` first** (GUIDED +
+//!   arm + NAV_TAKEOFF), then the goto. Optional `takeoff_altitude_m` caps the climb (default same as
+//!   `takeoff`; also at least `alt_m` when provided).
 //! - **`mission_interrupt`**: pause AUTO mission and hold (TUI `i`); needs GPS + home + recv thread.
 //! - **`mission_resume`**: upload snapshot and resume (TUI `c`); recv completes on `MISSION_ACK`.
 //! - **`waypoint_inject`**: guided goto; `{"lat_deg","lon_deg","alt_m"}` or `{"waypoint_text":"…"}` (TUI `w`).
+//!   Same **auto-takeoff** behavior as `goto_location` when disarmed or on the ground.
 //! - **`move_forward`**: optional `{"speed_m_s": 3}` forward body-frame velocity.
 
 #![allow(deprecated)]
@@ -24,6 +28,7 @@ use mavlink::ardupilotmega::{
 };
 use mavlink::MavConnection;
 use serde_json::Value;
+use std::time::Duration;
 
 /// Tool names accepted by [`apply_llm_drone_tool`] (also listed on `GET /health`).
 pub const LLM_DRONE_TOOL_NAMES: &[&str] = &[
@@ -120,6 +125,53 @@ fn f32_param(params: &Value, key: &str, default: f32) -> f32 {
         .and_then(|v| v.as_f64())
         .map(|x| x as f32)
         .unwrap_or(default)
+}
+
+/// Relative altitude (m, above home) below this ⇒ treat as on-ground when already armed.
+const ON_GROUND_REL_ALT_M: f64 = 3.0;
+
+fn needs_auto_takeoff(telem: &crate::mavlink_http_runtime::TelemetryCache) -> bool {
+    match telem.armed {
+        Some(false) => true,
+        Some(true) => telem
+            .relative_alt_m
+            .map(|a| a < ON_GROUND_REL_ALT_M)
+            .unwrap_or(false),
+        None => telem
+            .relative_alt_m
+            .map(|a| a < ON_GROUND_REL_ALT_M)
+            .unwrap_or(true),
+    }
+}
+
+/// If the vehicle is disarmed or on the ground, run **`takeoff`** before a guided goto.
+pub fn maybe_auto_takeoff_before_goto<C>(
+    conn: &mut C,
+    ids: VehicleIds,
+    telem: &crate::mavlink_http_runtime::TelemetryCache,
+    params: &Value,
+) -> Result<(), String>
+where
+    C: MavConnection<MavMessage>,
+{
+    if !needs_auto_takeoff(telem) {
+        return Ok(());
+    }
+    let target_alt = params
+        .get("alt_m")
+        .and_then(|v| v.as_f64())
+        .map(|x| x as f32)
+        .unwrap_or(0.0);
+    let mut takeoff_alt = f32_param(params, "takeoff_altitude_m", DEFAULT_TAKEOFF_ALTITUDE_M)
+        .max(5.0)
+        .max(target_alt);
+    if !takeoff_alt.is_finite() {
+        takeoff_alt = DEFAULT_TAKEOFF_ALTITUDE_M;
+    }
+    let takeoff_params = serde_json::json!({ "altitude_m": takeoff_alt });
+    apply_llm_drone_tool(conn, ids, "takeoff", &takeoff_params)?;
+    std::thread::sleep(Duration::from_millis(900));
+    Ok(())
 }
 
 /// Apply one tool; `params` is usually `{}` from the LLM path, or carries `seq` / positions for operator/API calls.

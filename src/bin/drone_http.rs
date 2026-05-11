@@ -23,7 +23,10 @@ use drone_server::mavlink_connect::{self, MavlinkArgsError};
 use drone_server::mavlink_http_runtime::{
     spawn_http_mavlink_recv_thread, HttpOverrideState, TelemetryCache,
 };
-use drone_server::tool_dispatch::{apply_llm_drone_tool, wait_autopilot_heartbeat, LLM_DRONE_TOOL_NAMES};
+use drone_server::tool_dispatch::{
+    apply_llm_drone_tool, maybe_auto_takeoff_before_goto, wait_autopilot_heartbeat,
+    LLM_DRONE_TOOL_NAMES,
+};
 use drone_server::{MissionStore, VehicleIds};
 use mavlink::ardupilotmega::MavMessage;
 use mavlink::{connect, Connection};
@@ -86,6 +89,51 @@ fn request_id_from_headers(h: &HeaderMap) -> String {
         .map(|s| s.to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| format!("drone-http-{}", std::process::id()))
+}
+
+#[derive(Serialize)]
+struct PositionResponse {
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lat_deg: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lon_deg: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    alt_amsl_m: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+async fn get_position(State(state): State<Arc<AppState>>) -> Json<PositionResponse> {
+    let t = match state.telem.lock() {
+        Ok(g) => g,
+        Err(_) => {
+            return Json(PositionResponse {
+                ok: false,
+                lat_deg: None,
+                lon_deg: None,
+                alt_amsl_m: None,
+                error: Some("telem_lock_poisoned".into()),
+            });
+        }
+    };
+    if let (Some(lat), Some(lon)) = (t.lat, t.lon) {
+        Json(PositionResponse {
+            ok: true,
+            lat_deg: Some(lat),
+            lon_deg: Some(lon),
+            alt_amsl_m: t.alt_amsl_m,
+            error: None,
+        })
+    } else {
+        Json(PositionResponse {
+            ok: false,
+            lat_deg: None,
+            lon_deg: None,
+            alt_amsl_m: None,
+            error: Some("no_global_position_yet".into()),
+        })
+    }
 }
 
 async fn get_health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
@@ -158,6 +206,15 @@ async fn post_apply_tool(
                 &st.telem,
                 &params_for_blocking,
             ),
+            "goto_location" => {
+                let snap = st
+                    .telem
+                    .lock()
+                    .map_err(|e| format!("telem_lock:{e}"))?;
+                maybe_auto_takeoff_before_goto(&mut *conn, ids, &*snap, &params_for_blocking)?;
+                drop(snap);
+                apply_llm_drone_tool(&mut *conn, ids, "goto_location", &params_for_blocking)
+            }
             "start_mission" => {
                 st.mission
                     .lock()
@@ -293,6 +350,7 @@ async fn main() {
 
     let app = Router::new()
         .route("/health", get(get_health))
+        .route("/v1/position", get(get_position))
         .route("/v1/apply-tool", post(post_apply_tool))
         .layer(TraceLayer::new_for_http())
         .layer(cors)
@@ -300,7 +358,7 @@ async fn main() {
 
     info!(
         listen = %args.listen,
-        "drone-http listening; POST /v1/apply-tool JSON {{\"tool\":\"return_to_home\"}}; GET /health"
+        "drone-http listening; GET /v1/position; POST /v1/apply-tool JSON {{\"tool\":\"return_to_home\"}}; GET /health"
     );
     eprintln!(
         "drone-http {} | MAVLink: {} | vehicle sys={} comp={}",
