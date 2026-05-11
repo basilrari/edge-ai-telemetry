@@ -123,10 +123,7 @@ pub fn waypoint_inject<C: MavConnection<MavMessage>>(
     telem: &Arc<Mutex<TelemetryCache>>,
     params: &Value,
 ) -> Result<(), String> {
-    {
-        let t = telem.lock().map_err(|e| format!("telem_lock:{e}"))?;
-        crate::tool_dispatch::maybe_auto_takeoff_before_goto(conn, ids, &*t, params)?;
-    }
+    crate::tool_dispatch::maybe_auto_takeoff_before_goto(conn, ids, telem, params)?;
 
     let (lat, lon, alt) = if let (Some(lat), Some(lon), Some(alt)) = (
         params.get("lat_deg").and_then(|v| v.as_f64()),

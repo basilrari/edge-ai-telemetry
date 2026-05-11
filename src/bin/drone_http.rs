@@ -207,12 +207,7 @@ async fn post_apply_tool(
                 &params_for_blocking,
             ),
             "goto_location" => {
-                let snap = st
-                    .telem
-                    .lock()
-                    .map_err(|e| format!("telem_lock:{e}"))?;
-                maybe_auto_takeoff_before_goto(&mut *conn, ids, &*snap, &params_for_blocking)?;
-                drop(snap);
+                maybe_auto_takeoff_before_goto(&mut *conn, ids, &st.telem, &params_for_blocking)?;
                 apply_llm_drone_tool(&mut *conn, ids, "goto_location", &params_for_blocking)
             }
             "start_mission" => {
