@@ -7,7 +7,8 @@
 //! - **`goto_location`**: `{"lat_deg":..,"lon_deg":..,"alt_m":..}` — `alt_m` is **relative to home**
 //!   (same convention as TUI interrupt / `COMMAND_INT` DO_REPOSITION). If the vehicle is **disarmed**
 //!   or **on the ground** (low relative altitude), **drone-http** runs **`takeoff` first** (GUIDED +
-//!   arm + NAV_TAKEOFF), waits briefly for **relative altitude** to climb, then the goto. Optional `takeoff_altitude_m` caps the climb (default same as
+//!   arm + NAV_TAKEOFF), waits briefly for **relative altitude** to climb (with NAV_TAKEOFF resends so
+//!   the vehicle does not sit on the ground until **DISARM_DELAY**), then the goto. Optional `takeoff_altitude_m` caps the climb (default same as
 //!   `takeoff`; also at least `alt_m` when provided).
 //! - **`mission_interrupt`**: pause AUTO mission and hold (TUI `i`); needs GPS + home + recv thread.
 //! - **`mission_resume`**: upload snapshot and resume (TUI `c`); recv completes on `MISSION_ACK`.
@@ -149,22 +150,47 @@ fn needs_auto_takeoff(telem: &TelemetryCache) -> bool {
     }
 }
 
-/// After NAV_TAKEOFF, wait until `GLOBAL_POSITION_INT` shows a climb (or timeout).
-fn wait_min_relative_alt_or_timeout(
+fn send_nav_takeoff_long<C>(conn: &mut C, ids: VehicleIds, alt_m: f32) -> Result<(), String>
+where
+    C: MavConnection<MavMessage>,
+{
+    let msg = with_vehicle(takeoff_alt(alt_m), ids);
+    conn.send_default(&msg).map(|_| ()).map_err(|e| e.to_string())
+}
+
+/// After the initial takeoff burst, poll altitude and **resend NAV_TAKEOFF** on a schedule.
+/// ArduCopter often **auto-disarms** after ~10s on the ground ([`DISARM_DELAY`](https://ardupilot.org/copter/docs/parameters-Copter-stable-V4.5.3.html));
+/// a long passive wait without climb lets that fire before we send the goto.
+fn wait_climb_resending_takeoff<C>(
+    conn: &mut C,
+    ids: VehicleIds,
     telem: &Arc<Mutex<TelemetryCache>>,
-    min_m: f64,
+    alt_m: f32,
+    min_climb_m: f64,
     timeout: Duration,
-) -> Result<(), String> {
+) -> Result<(), String>
+where
+    C: MavConnection<MavMessage>,
+{
+    // Extra NAV_TAKEOFF sends at these offsets from the **start of this wait** (ms).
+    const RESEND_AT_MS: &[u64] = &[600, 1400, 2300, 3200, 4500];
     let start = Instant::now();
+    let mut next_resend: usize = 0;
     while start.elapsed() < timeout {
         let reached = {
             let t = telem.lock().map_err(|e| format!("telem_lock:{e}"))?;
-            t.relative_alt_m.map(|a| a >= min_m).unwrap_or(false)
+            t.relative_alt_m.map(|a| a >= min_climb_m).unwrap_or(false)
         };
         if reached {
             return Ok(());
         }
-        std::thread::sleep(Duration::from_millis(200));
+        while next_resend < RESEND_AT_MS.len()
+            && start.elapsed() >= Duration::from_millis(RESEND_AT_MS[next_resend])
+        {
+            send_nav_takeoff_long(conn, ids, alt_m)?;
+            next_resend += 1;
+        }
+        std::thread::sleep(Duration::from_millis(100));
     }
     Ok(())
 }
@@ -199,9 +225,17 @@ where
     }
     let takeoff_params = serde_json::json!({ "altitude_m": takeoff_alt });
     apply_llm_drone_tool(conn, ids, "takeoff", &takeoff_params)?;
-    let min_climb_m = (f64::from(takeoff_alt) * 0.5)
-        .clamp(ON_GROUND_REL_ALT_M + 0.5, f64::from(takeoff_alt));
-    wait_min_relative_alt_or_timeout(telem, min_climb_m, Duration::from_secs(25))?;
+    let min_climb_m = (f64::from(takeoff_alt) * 0.35)
+        .clamp(ON_GROUND_REL_ALT_M + 0.3, f64::from(takeoff_alt));
+    // Stay under typical DISARM_DELAY (~10s): detect climb early + resend NAV_TAKEOFF inside the wait.
+    wait_climb_resending_takeoff(
+        conn,
+        ids,
+        telem,
+        takeoff_alt,
+        min_climb_m,
+        Duration::from_secs(8),
+    )?;
     Ok(())
 }
 
@@ -240,8 +274,15 @@ where
             conn.send_default(&arm_msg)
                 .map(|_| ())
                 .map_err(|e| e.to_string())?;
-            let msg = with_vehicle(takeoff_alt(alt), ids);
-            conn.send_default(&msg).map(|_| ()).map_err(|e| e.to_string())
+            // Let the FC finish arming before NAV_TAKEOFF; immediate back-to-back sends are often ignored.
+            std::thread::sleep(Duration::from_millis(350));
+            for burst in 0..3 {
+                send_nav_takeoff_long(conn, ids, alt)?;
+                if burst < 2 {
+                    std::thread::sleep(Duration::from_millis(320));
+                }
+            }
+            Ok(())
         }
         "start_mission" => {
             // TUI `m`: AUTO then MISSION_START. `drone-http` runs [`MissionStore::validate_ready_for_start_mission`] first (same rules as TUI before send).
