@@ -23,10 +23,7 @@ use drone_server::mavlink_connect::{self, MavlinkArgsError};
 use drone_server::mavlink_http_runtime::{
     spawn_http_mavlink_recv_thread, HttpOverrideState, TelemetryCache,
 };
-use drone_server::tool_dispatch::{
-    apply_llm_drone_tool, maybe_auto_takeoff_before_goto, wait_autopilot_heartbeat,
-    LLM_DRONE_TOOL_NAMES,
-};
+use drone_server::tool_dispatch::{apply_llm_drone_tool, wait_autopilot_heartbeat, LLM_DRONE_TOOL_NAMES};
 use drone_server::{MissionStore, VehicleIds};
 use mavlink::ardupilotmega::MavMessage;
 use mavlink::{connect, Connection};
@@ -206,18 +203,36 @@ async fn post_apply_tool(
                 &st.telem,
                 &params_for_blocking,
             ),
-            "goto_location" => {
-                maybe_auto_takeoff_before_goto(&mut *conn, ids, &st.telem, &params_for_blocking)?;
-                apply_llm_drone_tool(&mut *conn, ids, "goto_location", &params_for_blocking)
-            }
+            "goto_location" => apply_llm_drone_tool(
+                &mut *conn,
+                ids,
+                "goto_location",
+                &params_for_blocking,
+                None,
+            ),
             "start_mission" => {
                 st.mission
                     .lock()
                     .map_err(|e| format!("mission_lock:{e}"))?
                     .validate_ready_for_start_mission()?;
-                apply_llm_drone_tool(&mut *conn, ids, "start_mission", &params_for_blocking)
+                apply_llm_drone_tool(
+                    &mut *conn,
+                    ids,
+                    "start_mission",
+                    &params_for_blocking,
+                    None,
+                )
             }
-            _ => apply_llm_drone_tool(&mut *conn, ids, &tool_for_blocking, &params_for_blocking),
+            _ => {
+                let telem_guard = st.telem.lock().map_err(|e| format!("telem_lock:{e}"))?;
+                apply_llm_drone_tool(
+                    &mut *conn,
+                    ids,
+                    &tool_for_blocking,
+                    &params_for_blocking,
+                    Some(&*telem_guard),
+                )
+            }
         }
     })
     .await;

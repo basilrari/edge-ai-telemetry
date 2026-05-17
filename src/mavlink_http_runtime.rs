@@ -34,6 +34,27 @@ impl Default for HttpOverrideState {
     }
 }
 
+/// Resolve `NAV_TAKEOFF` target altitude (meters above home, same convention as `goto_location` `alt_m`).
+pub fn resolve_takeoff_altitude_m(
+    params: &serde_json::Value,
+    telem: &TelemetryCache,
+) -> Result<f32, String> {
+    if let Some(v) = params.get("altitude_m").and_then(|v| v.as_f64()) {
+        return Ok(v as f32);
+    }
+    if let Some(rel) = telem.relative_alt_m {
+        return Ok(rel.max(0.0) as f32);
+    }
+    if let (Some(alt), Some(home)) = (telem.alt_amsl_m, telem.home_alt_m) {
+        return Ok((alt - home).max(0.0) as f32);
+    }
+    Err(
+        "takeoff: no params.altitude_m and no position telemetry yet (GLOBAL_POSITION_INT); \
+         wait for GPS or specify altitude_m"
+            .into(),
+    )
+}
+
 /// Latest position / mode for HTTP tools (`mission_interrupt`, `waypoint_inject` text parsing).
 #[derive(Default)]
 pub struct TelemetryCache {
