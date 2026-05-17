@@ -2,11 +2,11 @@
 //!
 //! Optional JSON **`params`** on `POST /v1/apply-tool` (same object the gateway forwards):
 //! - **`arm`**: sends **GUIDED** (`DO_SET_MODE`) then **arm** — ArduPilot-friendly; the LLM does not need a separate `set_mode_guided` before `arm` for normal launch flows.
-//! - **`takeoff`**: optional `{"altitude_m": <m>}` (meters above home). Omit `altitude_m` to use **current**
+//! - **`takeoff`**: optional `{"altitude_m": <m>}` (meters above home). `0` or omitted with no usable telemetry → **15 m**; omit with telemetry to use **current**
 //!   altitude above home from telemetry (`GLOBAL_POSITION_INT`). **`MAV_CMD_NAV_TAKEOFF` only** — use after **`arm`**.
 //! - **`mission_set_current`**: `{"seq": 0}` (required) — sets **current mission item index** on the FC (`DO_SET_MISSION_CURRENT`); does not upload a mission or replace **`start_mission`** for “fly the mission”.
 //! - **`goto_location`**: `{"lat_deg":..,"lon_deg":..,"alt_m":..}` — `alt_m` is **relative to home**
-//!   (same convention as TUI interrupt / `COMMAND_INT` DO_REPOSITION). **No** automatic takeoff; the LLM should emit **`arm`**, **`takeoff`**, then **`goto_location`** when starting from the ground.
+//!   (same convention as TUI interrupt / `COMMAND_INT` DO_REPOSITION). Omitted or `<= 0` → **15 m**. **No** automatic takeoff; the LLM should emit **`arm`**, **`takeoff`**, then **`goto_location`** when starting from the ground.
 //! - **`mission_interrupt`**: pause AUTO mission and hold (TUI `i`); needs GPS + home + recv thread.
 //! - **`mission_resume`**: upload snapshot and resume (TUI `c`); recv completes on `MISSION_ACK`.
 //! - **`waypoint_inject`**: guided goto; `{"lat_deg","lon_deg","alt_m"}` or `{"waypoint_text":"…"}` (TUI `w`). **No** automatic takeoff.
@@ -14,7 +14,9 @@
 
 #![allow(deprecated)]
 
-use crate::mavlink_http_runtime::{resolve_takeoff_altitude_m, TelemetryCache};
+use crate::mavlink_http_runtime::{
+    altitude_above_home_from_params, resolve_takeoff_altitude_m, TelemetryCache,
+};
 use crate::{
     arm, disarm, force_arm, goto_global_command_int, land, mission_set_current, mission_start, rtl,
     set_mode_auto, set_mode_guided, set_mode_guided_long, takeoff_alt, with_vehicle, VehicleIds,
@@ -157,7 +159,7 @@ where
         "set_mode_guided" | "hover" => set_mode_guided_long(conn, ids).map_err(|e| e.to_string()),
         "takeoff" => {
             let alt = if params.get("altitude_m").is_some() {
-                f32_param(&params, "altitude_m", 0.0)
+                altitude_above_home_from_params(&params, "altitude_m")
             } else {
                 let telem = telem.ok_or_else(|| {
                     "takeoff: altitude_m omitted; telemetry required for current altitude".to_string()
@@ -193,12 +195,7 @@ where
                 .get("lon_deg")
                 .and_then(|v| v.as_f64())
                 .ok_or_else(|| "goto_location requires params.lon_deg".to_string())?;
-            let alt = params
-                .get("alt_m")
-                .and_then(|v| v.as_f64())
-                .ok_or_else(|| {
-                    "goto_location requires params.alt_m (relative to home, meters)".to_string()
-                })?;
+            let alt = altitude_above_home_from_params(&params, "alt_m") as f64;
             let msg = goto_global_command_int(ids, lat, lon, alt);
             conn.send_default(&msg).map(|_| ()).map_err(|e| e.to_string())
         }

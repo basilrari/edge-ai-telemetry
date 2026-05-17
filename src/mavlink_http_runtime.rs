@@ -34,25 +34,71 @@ impl Default for HttpOverrideState {
     }
 }
 
+/// Default target height above home when altitude is omitted, zero, or non-positive.
+pub const DEFAULT_ALTITUDE_ABOVE_HOME_M: f32 = 15.0;
+
+/// Meters above home: finite values `> 0` are used as-is; otherwise `DEFAULT_ALTITUDE_ABOVE_HOME_M`.
+pub fn altitude_above_home_m(value: Option<f64>) -> f32 {
+    match value {
+        Some(v) if v.is_finite() && v > 0.0 => v as f32,
+        _ => DEFAULT_ALTITUDE_ABOVE_HOME_M,
+    }
+}
+
+pub fn altitude_above_home_from_params(
+    params: &serde_json::Value,
+    key: &str,
+) -> f32 {
+    altitude_above_home_m(params.get(key).and_then(|v| v.as_f64()))
+}
+
 /// Resolve `NAV_TAKEOFF` target altitude (meters above home, same convention as `goto_location` `alt_m`).
 pub fn resolve_takeoff_altitude_m(
     params: &serde_json::Value,
     telem: &TelemetryCache,
 ) -> Result<f32, String> {
-    if let Some(v) = params.get("altitude_m").and_then(|v| v.as_f64()) {
-        return Ok(v as f32);
+    if params.get("altitude_m").is_some() {
+        return Ok(altitude_above_home_from_params(params, "altitude_m"));
     }
     if let Some(rel) = telem.relative_alt_m {
-        return Ok(rel.max(0.0) as f32);
+        return Ok(altitude_above_home_m(Some(rel)));
     }
     if let (Some(alt), Some(home)) = (telem.alt_amsl_m, telem.home_alt_m) {
-        return Ok((alt - home).max(0.0) as f32);
+        return Ok(altitude_above_home_m(Some((alt - home).max(0.0))));
     }
     Err(
         "takeoff: no params.altitude_m and no position telemetry yet (GLOBAL_POSITION_INT); \
          wait for GPS or specify altitude_m"
             .into(),
     )
+}
+
+#[cfg(test)]
+mod altitude_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn zero_or_missing_uses_default() {
+        assert_eq!(altitude_above_home_m(None), DEFAULT_ALTITUDE_ABOVE_HOME_M);
+        assert_eq!(altitude_above_home_m(Some(0.0)), DEFAULT_ALTITUDE_ABOVE_HOME_M);
+        assert_eq!(altitude_above_home_m(Some(-1.0)), DEFAULT_ALTITUDE_ABOVE_HOME_M);
+    }
+
+    #[test]
+    fn positive_unchanged() {
+        assert_eq!(altitude_above_home_m(Some(30.0)), 30.0);
+    }
+
+    #[test]
+    fn takeoff_explicit_zero_defaults() {
+        let telem = TelemetryCache::default();
+        let params = json!({ "altitude_m": 0 });
+        assert_eq!(
+            resolve_takeoff_altitude_m(&params, &telem).unwrap(),
+            DEFAULT_ALTITUDE_ABOVE_HOME_M
+        );
+    }
 }
 
 /// Latest position / mode for HTTP tools (`mission_interrupt`, `waypoint_inject` text parsing).

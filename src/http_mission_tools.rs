@@ -8,7 +8,9 @@ use crate::goto_global_command_int;
 use crate::set_mode_guided;
 use crate::MissionStore;
 use crate::VehicleIds;
-use crate::mavlink_http_runtime::{HttpOverrideState, TelemetryCache};
+use crate::mavlink_http_runtime::{
+    altitude_above_home_m, HttpOverrideState, TelemetryCache,
+};
 use mavlink::ardupilotmega::MavMessage;
 use mavlink::MavConnection;
 use serde_json::Value;
@@ -123,11 +125,12 @@ pub fn waypoint_inject<C: MavConnection<MavMessage>>(
     telem: &Arc<Mutex<TelemetryCache>>,
     params: &Value,
 ) -> Result<(), String> {
-    let (lat, lon, alt) = if let (Some(lat), Some(lon), Some(alt)) = (
+    let (lat, lon, alt) = if let (Some(lat), Some(lon), _) = (
         params.get("lat_deg").and_then(|v| v.as_f64()),
         params.get("lon_deg").and_then(|v| v.as_f64()),
         params.get("alt_m").and_then(|v| v.as_f64()),
     ) {
+        let alt = altitude_above_home_m(params.get("alt_m").and_then(|v| v.as_f64())) as f64;
         (lat, lon, alt)
     } else if let Some(text) = params.get("waypoint_text").and_then(|v| v.as_str()) {
         let t = telem.lock().map_err(|e| format!("telem_lock:{e}"))?;
