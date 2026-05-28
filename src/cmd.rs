@@ -7,7 +7,7 @@ use mavlink::MavConnection;
 const MAV_MODE_FLAG_CUSTOM_MODE_ENABLED: f32 = 1.0;
 
 fn ardupilot_set_custom_mode<C>(
-    conn: &mut C,
+    conn: &C,
     ids: VehicleIds,
     custom_mode: f32,
 ) -> Result<(), mavlink::error::MessageWriteError>
@@ -64,7 +64,7 @@ pub fn with_vehicle(mut msg: MavMessage, ids: VehicleIds) -> MavMessage {
 }
 
 /// TUI `g`: `MAV_CMD_DO_SET_MODE` → ArduCopter GUIDED (custom mode 4).
-pub fn set_mode_guided_long<C>(conn: &mut C, ids: VehicleIds) -> Result<(), mavlink::error::MessageWriteError>
+pub fn set_mode_guided_long<C>(conn: &C, ids: VehicleIds) -> Result<(), mavlink::error::MessageWriteError>
 where
     C: MavConnection<MavMessage>,
 {
@@ -72,7 +72,7 @@ where
 }
 
 /// TUI `u`: `MAV_CMD_DO_SET_MODE` → ArduCopter AUTO (custom mode 3).
-pub fn set_mode_auto_long<C>(conn: &mut C, ids: VehicleIds) -> Result<(), mavlink::error::MessageWriteError>
+pub fn set_mode_auto_long<C>(conn: &C, ids: VehicleIds) -> Result<(), mavlink::error::MessageWriteError>
 where
     C: MavConnection<MavMessage>,
 {
@@ -80,7 +80,7 @@ where
 }
 
 /// Same as [`set_mode_guided_long`] (HTTP tools and interrupt path use this name).
-pub fn set_mode_guided<C>(conn: &mut C, ids: VehicleIds) -> Result<(), mavlink::error::MessageWriteError>
+pub fn set_mode_guided<C>(conn: &C, ids: VehicleIds) -> Result<(), mavlink::error::MessageWriteError>
 where
     C: MavConnection<MavMessage>,
 {
@@ -88,7 +88,7 @@ where
 }
 
 /// Same as [`set_mode_auto_long`].
-pub fn set_mode_auto<C>(conn: &mut C, ids: VehicleIds) -> Result<(), mavlink::error::MessageWriteError>
+pub fn set_mode_auto<C>(conn: &C, ids: VehicleIds) -> Result<(), mavlink::error::MessageWriteError>
 where
     C: MavConnection<MavMessage>,
 {
@@ -175,7 +175,7 @@ impl VehicleIds {
 }
 
 /// Send a force-arm command (param2 = 211 magic value) to the vehicle.
-pub fn force_arm<C>(conn: &mut C, ids: VehicleIds) -> Result<(), mavlink::error::MessageWriteError>
+pub fn force_arm<C>(conn: &C, ids: VehicleIds) -> Result<(), mavlink::error::MessageWriteError>
 where
     C: MavConnection<MavMessage>,
 {
@@ -197,7 +197,7 @@ where
 }
 
 /// Send RTL (return to launch) command to the vehicle.
-pub fn rtl<C>(conn: &mut C, ids: VehicleIds) -> Result<(), mavlink::error::MessageWriteError>
+pub fn rtl<C>(conn: &C, ids: VehicleIds) -> Result<(), mavlink::error::MessageWriteError>
 where
     C: MavConnection<MavMessage>,
 {
@@ -219,7 +219,7 @@ where
 }
 
 /// Send land command to the vehicle.
-pub fn land<C>(conn: &mut C, ids: VehicleIds) -> Result<(), mavlink::error::MessageWriteError>
+pub fn land<C>(conn: &C, ids: VehicleIds) -> Result<(), mavlink::error::MessageWriteError>
 where
     C: MavConnection<MavMessage>,
 {
@@ -242,7 +242,7 @@ where
 
 /// Set the current mission item index (MAV_CMD_DO_SET_MISSION_CURRENT). Use when resuming after override.
 pub fn mission_set_current<C>(
-    conn: &mut C,
+    conn: &C,
     ids: VehicleIds,
     seq: u16,
 ) -> Result<(), mavlink::error::MessageWriteError>
@@ -285,7 +285,7 @@ pub fn mission_start_message(ids: VehicleIds) -> MavMessage {
 }
 
 /// Start mission execution (MAV_CMD_MISSION_START). Call after set_mode_auto and mission_set_current when resuming.
-pub fn mission_start<C>(conn: &mut C, ids: VehicleIds) -> Result<(), mavlink::error::MessageWriteError>
+pub fn mission_start<C>(conn: &C, ids: VehicleIds) -> Result<(), mavlink::error::MessageWriteError>
 where
     C: MavConnection<MavMessage>,
 {

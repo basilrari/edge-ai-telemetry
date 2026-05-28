@@ -11,22 +11,21 @@
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
-
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use clap::Parser;
+use drone_server::flight_log::FlightLog;
 use drone_server::http_mission_tools;
-use drone_server::mavlink_connect::{self, MavlinkArgsError};
+use drone_server::mavlink_connect::{self, LinkInfo};
 use drone_server::mavlink_http_runtime::{
-    spawn_http_mavlink_recv_thread, HttpOverrideState, TelemetryCache,
+    arducopter_mode_name, spawn_http_mavlink_recv_thread, HttpOverrideState, TelemetryCache,
 };
-use drone_server::tool_dispatch::{apply_llm_drone_tool, wait_autopilot_heartbeat, LLM_DRONE_TOOL_NAMES};
+use drone_server::tool_dispatch::{apply_llm_drone_tool, LLM_DRONE_TOOL_NAMES};
 use drone_server::{MissionStore, VehicleIds};
 use mavlink::ardupilotmega::MavMessage;
-use mavlink::{connect, Connection};
+use mavlink::Connection;
 use serde::{Deserialize, Serialize};
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
@@ -44,11 +43,14 @@ struct Args {
 }
 
 struct AppState {
-    conn: Arc<Mutex<Connection<MavMessage>>>,
+    /// Shared MAVLink link; serial uses separate read/write locks inside the driver (no outer Mutex).
+    conn: Arc<Connection<MavMessage>>,
+    link: LinkInfo,
     vehicle_ids: Arc<Mutex<VehicleIds>>,
     mission: Arc<Mutex<MissionStore>>,
     override_state: Arc<Mutex<HttpOverrideState>>,
     telem: Arc<Mutex<TelemetryCache>>,
+    flight_log: FlightLog,
 }
 
 fn default_empty_object() -> serde_json::Value {
@@ -78,6 +80,60 @@ struct HealthResponse {
     mavlink_target_system: u8,
     mavlink_target_component: u8,
     known_tools: &'static [&'static str],
+    link: LinkInfo,
+}
+
+#[derive(Serialize)]
+struct TelemetryResponse {
+    ok: bool,
+    link: LinkInfo,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lat_deg: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lon_deg: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    alt_amsl_m: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    alt_rel_m: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    groundspeed_m_s: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    airspeed_m_s: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    climb_m_s: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    heading_deg: Option<i16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    roll_deg: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pitch_deg: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    yaw_deg: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    armed: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mode: Option<String>,
+}
+
+#[derive(Serialize)]
+struct MissionWaypointJson {
+    seq: u16,
+    lat_deg: f64,
+    lon_deg: f64,
+    alt_m: f32,
+    command: u16,
+}
+
+#[derive(Serialize)]
+struct MissionResponse {
+    ok: bool,
+    current_seq: Option<u16>,
+    waypoints: Vec<MissionWaypointJson>,
+}
+
+#[derive(Serialize)]
+struct LogsResponse {
+    entries: Vec<drone_server::flight_log::FlightLogEntry>,
 }
 
 fn request_id_from_headers(h: &HeaderMap) -> String {
@@ -144,6 +200,87 @@ async fn get_health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> 
         mavlink_target_system: ids.system_id,
         mavlink_target_component: ids.component_id,
         known_tools: LLM_DRONE_TOOL_NAMES,
+        link: state.link.clone(),
+    })
+}
+
+async fn get_telemetry(State(state): State<Arc<AppState>>) -> Json<TelemetryResponse> {
+    let t = match state.telem.lock() {
+        Ok(g) => g,
+        Err(_) => {
+            return Json(TelemetryResponse {
+                ok: false,
+                link: state.link.clone(),
+                lat_deg: None,
+                lon_deg: None,
+                alt_amsl_m: None,
+                alt_rel_m: None,
+                groundspeed_m_s: None,
+                airspeed_m_s: None,
+                climb_m_s: None,
+                heading_deg: None,
+                roll_deg: None,
+                pitch_deg: None,
+                yaw_deg: None,
+                armed: None,
+                mode: None,
+            });
+        }
+    };
+    Json(TelemetryResponse {
+        ok: t.lat.is_some() && t.lon.is_some(),
+        link: state.link.clone(),
+        lat_deg: t.lat,
+        lon_deg: t.lon,
+        alt_amsl_m: t.alt_amsl_m,
+        alt_rel_m: t.relative_alt_m,
+        groundspeed_m_s: t.groundspeed_m_s,
+        airspeed_m_s: t.airspeed_m_s,
+        climb_m_s: t.climb_m_s,
+        heading_deg: t.heading_deg,
+        roll_deg: t.roll_deg,
+        pitch_deg: t.pitch_deg,
+        yaw_deg: t.yaw_deg,
+        armed: t.armed,
+        mode: t
+            .mode_name
+            .clone()
+            .or_else(|| t.heartbeat_custom_mode.map(arducopter_mode_name).map(str::to_string)),
+    })
+}
+
+async fn get_mission(State(state): State<Arc<AppState>>) -> Json<MissionResponse> {
+    let store = match state.mission.lock() {
+        Ok(g) => g,
+        Err(_) => {
+            return Json(MissionResponse {
+                ok: false,
+                current_seq: None,
+                waypoints: vec![],
+            });
+        }
+    };
+    let waypoints: Vec<MissionWaypointJson> = store
+        .items
+        .iter()
+        .map(|w| MissionWaypointJson {
+            seq: w.seq,
+            lat_deg: w.x as f64 / 1e7,
+            lon_deg: w.y as f64 / 1e7,
+            alt_m: w.z as f32,
+            command: w.command as u16,
+        })
+        .collect();
+    Json(MissionResponse {
+        ok: true,
+        current_seq: store.current_seq,
+        waypoints,
+    })
+}
+
+async fn get_logs(State(state): State<Arc<AppState>>) -> Json<LogsResponse> {
+    Json(LogsResponse {
+        entries: state.flight_log.snapshot(),
     })
 }
 
@@ -165,6 +302,10 @@ async fn post_apply_tool(
         tool = %body.tool,
         "apply_tool: received HTTP request"
     );
+    state.flight_log.push(
+        "info",
+        format!("apply_tool: {} params={}", body.tool, body.params),
+    );
 
     let tool_for_blocking = body.tool.clone();
     let params_for_blocking = body.params.clone();
@@ -177,26 +318,23 @@ async fn post_apply_tool(
             .lock()
             .map(|g| *g)
             .map_err(|e| format!("vehicle_ids_lock:{e}"))?;
-        let mut conn = st
-            .conn
-            .lock()
-            .map_err(|e| format!("internal_lock_failed:{e}"))?;
+        let conn = Arc::clone(&st.conn);
         match tool_for_blocking.as_str() {
             "mission_interrupt" => http_mission_tools::mission_interrupt(
-                &mut *conn,
+                conn.as_ref(),
                 ids,
                 &st.mission,
                 &st.override_state,
                 &st.telem,
             ),
             "mission_resume" => http_mission_tools::mission_resume(
-                &mut *conn,
+                conn.as_ref(),
                 ids,
                 &st.mission,
                 &st.override_state,
             ),
             "waypoint_inject" => http_mission_tools::waypoint_inject(
-                &mut *conn,
+                conn.as_ref(),
                 ids,
                 &st.mission,
                 &st.override_state,
@@ -204,7 +342,7 @@ async fn post_apply_tool(
                 &params_for_blocking,
             ),
             "goto_location" => apply_llm_drone_tool(
-                &mut *conn,
+                conn.as_ref(),
                 ids,
                 "goto_location",
                 &params_for_blocking,
@@ -216,7 +354,7 @@ async fn post_apply_tool(
                     .map_err(|e| format!("mission_lock:{e}"))?
                     .validate_ready_for_start_mission()?;
                 apply_llm_drone_tool(
-                    &mut *conn,
+                    conn.as_ref(),
                     ids,
                     "start_mission",
                     &params_for_blocking,
@@ -226,7 +364,7 @@ async fn post_apply_tool(
             _ => {
                 let telem_guard = st.telem.lock().map_err(|e| format!("telem_lock:{e}"))?;
                 apply_llm_drone_tool(
-                    &mut *conn,
+                    conn.as_ref(),
                     ids,
                     &tool_for_blocking,
                     &params_for_blocking,
@@ -246,10 +384,12 @@ async fn post_apply_tool(
     let (ok, err) = match result {
         Ok(Ok(())) => {
             info!(request_id = %rid, tool = %tool_name_for_log, "apply_tool: MAVLink send OK");
+            state.flight_log.push("info", format!("OK: {tool_name_for_log}"));
             (true, None)
         }
         Ok(Err(e)) => {
             warn!(request_id = %rid, tool = %tool_name_for_log, error = %e, "apply_tool: MAVLink or tool error");
+            state.flight_log.push("warn", format!("FAIL {tool_name_for_log}: {e}"));
             (false, Some(e))
         }
         Err(join_err) => {
@@ -287,46 +427,25 @@ async fn main() {
         .init();
 
     let args = Args::parse();
-    let (mavlink_url, link_display) = match mavlink_connect::resolve_from_args(args.mavlink.clone()) {
+    if args.mavlink.iter().any(|a| a == "-h" || a == "--help") {
+        eprintln!("MAVLink options (same as `tui`):\n{}", mavlink_connect::usage_string());
+        eprintln!("\nWith no MAVLink args, drone-http auto-detects UDP (MAVProxy) then USB serial.");
+        std::process::exit(0);
+    }
+
+    let flight_log = FlightLog::new();
+    let (connection, link) = match mavlink_connect::open_connection(args.mavlink.clone()) {
         Ok(v) => v,
-        Err(MavlinkArgsError::Help) => {
-            eprintln!("MAVLink options (same as `tui`):\n{}", mavlink_connect::usage_string());
-            std::process::exit(0);
-        }
-        Err(MavlinkArgsError::Invalid(m)) => {
-            eprintln!("{m}");
-            std::process::exit(2);
-        }
-    };
-
-    info!(%mavlink_url, display = %link_display, "opening MAVLink connection");
-    let mut connection = match connect::<MavMessage>(&mavlink_url) {
-        Ok(conn) => conn,
         Err(e) => {
-            error!("{}", mavlink_connect::open_error_message(&mavlink_url, &e));
+            error!(error = %e, "failed to open MAVLink");
             std::process::exit(1);
         }
     };
-    mavlink_connect::tune_connection(&mut connection);
+    info!(url = %link.url, kind = %link.kind, display = %link.display, "MAVLink connected");
+    flight_log.push("info", format!("Link: {} ({})", link.display, link.kind));
 
-    info!("waiting for autopilot HEARTBEAT (up to 60s)…");
-    let vehicle_ids = match wait_autopilot_heartbeat(&mut connection, Duration::from_secs(60)) {
-        Ok(ids) => {
-            info!(
-                system = ids.system_id,
-                component = ids.component_id,
-                "autopilot heartbeat OK"
-            );
-            ids
-        }
-        Err(e) => {
-            error!(error = %e, "failed to acquire vehicle IDs from MAVLink");
-            std::process::exit(1);
-        }
-    };
-
-    let conn = Arc::new(Mutex::new(connection));
-    let vehicle_ids = Arc::new(Mutex::new(vehicle_ids));
+    let conn = Arc::new(connection);
+    let vehicle_ids = Arc::new(Mutex::new(VehicleIds::new(1, 1)));
     let mission = Arc::new(Mutex::new(MissionStore::default()));
     let override_state = Arc::new(Mutex::new(HttpOverrideState::default()));
     let telem = Arc::new(Mutex::new(TelemetryCache::default()));
@@ -337,14 +456,17 @@ async fn main() {
         Arc::clone(&override_state),
         Arc::clone(&telem),
         Arc::clone(&vehicle_ids),
+        flight_log.clone(),
     );
 
     let state = Arc::new(AppState {
         conn,
+        link: link.clone(),
         vehicle_ids: Arc::clone(&vehicle_ids),
         mission,
         override_state,
         telem,
+        flight_log,
     });
 
     let ids_display = vehicle_ids.lock().map(|g| *g).unwrap_or_default();
@@ -361,6 +483,9 @@ async fn main() {
     let app = Router::new()
         .route("/health", get(get_health))
         .route("/v1/position", get(get_position))
+        .route("/v1/telemetry", get(get_telemetry))
+        .route("/v1/mission", get(get_mission))
+        .route("/v1/logs", get(get_logs))
         .route("/v1/apply-tool", post(post_apply_tool))
         .layer(TraceLayer::new_for_http())
         .layer(cors)
@@ -373,7 +498,7 @@ async fn main() {
     eprintln!(
         "drone-http {} | MAVLink: {} | vehicle sys={} comp={}",
         args.listen,
-        link_display,
+        link.display,
         ids_display.system_id,
         ids_display.component_id
     );

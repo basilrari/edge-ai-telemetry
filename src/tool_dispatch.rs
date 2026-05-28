@@ -20,7 +20,9 @@ use crate::mavlink_http_runtime::{
 use crate::{
     arm, disarm, force_arm, goto_global_command_int, land, mission_set_current, mission_start, rtl,
     set_mode_auto, set_mode_guided, set_mode_guided_long, takeoff_alt, with_vehicle, VehicleIds,
+    CUSTOM_MODE_GUIDED,
 };
+use std::time::Duration;
 use mavlink::ardupilotmega::{
     COMMAND_LONG_DATA, MavCmd, MavFrame, MavMessage, MavType, PositionTargetTypemask,
     SET_POSITION_TARGET_LOCAL_NED_DATA,
@@ -54,7 +56,7 @@ const MODE_FLAG_CUSTOM_MODE_ENABLED: f32 = 1.0;
 const ARDUCOPTER_MODE_CIRCLE: f32 = 7.0;
 
 fn set_arducopter_mode_long<C>(
-    conn: &mut C,
+    conn: &C,
     ids: VehicleIds,
     custom_mode: f32,
 ) -> Result<(), mavlink::error::MessageWriteError>
@@ -78,7 +80,7 @@ where
 }
 
 fn send_body_forward_velocity<C>(
-    conn: &mut C,
+    conn: &C,
     ids: VehicleIds,
     vx_m_s: f32,
 ) -> Result<(), mavlink::error::MessageWriteError>
@@ -129,7 +131,7 @@ fn f32_param(params: &Value, key: &str, default: f32) -> f32 {
 ///
 /// For **`takeoff`**, pass `telem` so omitted `altitude_m` can use the vehicle's current height above home.
 pub fn apply_llm_drone_tool<C>(
-    conn: &mut C,
+    conn: &C,
     ids: VehicleIds,
     tool: &str,
     params: &Value,
@@ -146,7 +148,15 @@ where
 
     match tool {
         "arm" => {
-            set_mode_guided_long(conn, ids).map_err(|e| e.to_string())?;
+            let already_guided = telem
+                .and_then(|t| t.heartbeat_custom_mode)
+                .map(|m| m == CUSTOM_MODE_GUIDED)
+                .unwrap_or(false);
+            if !already_guided {
+                set_mode_guided_long(conn, ids).map_err(|e| e.to_string())?;
+                // USB serial: back-to-back writes can time out; brief pause before arm.
+                std::thread::sleep(Duration::from_millis(150));
+            }
             let msg = with_vehicle(arm(), ids);
             conn.send_default(&msg).map(|_| ()).map_err(|e| e.to_string())
         }
@@ -214,7 +224,7 @@ where
     }
 }
 
-fn request_mission_and_streams<C>(conn: &mut C, ids: VehicleIds) -> Result<(), mavlink::error::MessageWriteError>
+fn request_mission_and_streams<C>(conn: &C, ids: VehicleIds) -> Result<(), mavlink::error::MessageWriteError>
 where
     C: MavConnection<MavMessage>,
 {
@@ -239,7 +249,7 @@ where
 }
 
 pub fn wait_autopilot_heartbeat<C>(
-    conn: &mut C,
+    conn: &C,
     timeout: std::time::Duration,
 ) -> Result<VehicleIds, String>
 where

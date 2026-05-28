@@ -19,7 +19,7 @@ const ARDUCOPTER_CUSTOM_AUTO: u32 = 3;
 
 /// Mission interrupt (TUI `i`): snapshot mission, GUIDED + DO_REPOSITION at current position (alt relative to home).
 pub fn mission_interrupt<C: MavConnection<MavMessage>>(
-    conn: &mut C,
+    conn: &C,
     ids: VehicleIds,
     mission: &Arc<Mutex<MissionStore>>,
     override_state: &Arc<Mutex<HttpOverrideState>>,
@@ -71,7 +71,7 @@ pub fn mission_interrupt<C: MavConnection<MavMessage>>(
 
 /// Resume mission after interrupt (TUI `c`): `MISSION_COUNT` upload handshake; recv thread completes on `MISSION_ACK`.
 pub fn mission_resume<C: MavConnection<MavMessage>>(
-    conn: &mut C,
+    conn: &C,
     ids: VehicleIds,
     mission: &Arc<Mutex<MissionStore>>,
     override_state: &Arc<Mutex<HttpOverrideState>>,
@@ -118,7 +118,7 @@ pub fn mission_resume<C: MavConnection<MavMessage>>(
 
 /// Guided waypoint inject (TUI `w` after Enter). Params: `{"lat_deg","lon_deg","alt_m"}` **or** `{"waypoint_text":"..."}` (same syntax as TUI).
 pub fn waypoint_inject<C: MavConnection<MavMessage>>(
-    conn: &mut C,
+    conn: &C,
     ids: VehicleIds,
     mission: &Arc<Mutex<MissionStore>>,
     override_state: &Arc<Mutex<HttpOverrideState>>,

@@ -3,6 +3,7 @@
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+use crate::flight_log::FlightLog;
 use crate::geo::horizontal_distance_m;
 use crate::mavlink_streams::{heartbeat_from_autopilot, refresh_mavlink_streams};
 use crate::{
@@ -101,7 +102,39 @@ mod altitude_tests {
     }
 }
 
-/// Latest position / mode for HTTP tools (`mission_interrupt`, `waypoint_inject` text parsing).
+pub fn arducopter_mode_name(custom_mode: u32) -> &'static str {
+    match custom_mode {
+        0 => "STABILIZE",
+        1 => "ACRO",
+        2 => "ALT_HOLD",
+        3 => "AUTO",
+        4 => "GUIDED",
+        5 => "LOITER",
+        6 => "RTL",
+        7 => "CIRCLE",
+        8 => "POSITION",
+        9 => "LAND",
+        10 => "DRIFT",
+        11 => "SPORT",
+        12 => "FLIP",
+        13 => "AUTOTUNE",
+        14 => "POSHOLD",
+        15 => "BRAKE",
+        16 => "THROW",
+        17 => "AVOID_ADSB",
+        18 => "GUIDED_NOGPS",
+        19 => "SMART_RTL",
+        20 => "FLOWHOLD",
+        21 => "FOLLOW",
+        22 => "ZIGZAG",
+        23 => "SYSTEMID",
+        24 => "AUTOROTATE",
+        25 => "AUTO_RTL",
+        _ => "UNKNOWN",
+    }
+}
+
+/// Latest position / HUD for HTTP tools and dashboard.
 #[derive(Default)]
 pub struct TelemetryCache {
     pub lat: Option<f64>,
@@ -109,26 +142,46 @@ pub struct TelemetryCache {
     pub alt_amsl_m: Option<f64>,
     pub home_alt_m: Option<f64>,
     pub heartbeat_custom_mode: Option<u32>,
+    pub mode_name: Option<String>,
     /// From HEARTBEAT `base_mode` (autopilot only).
     pub armed: Option<bool>,
     /// From GLOBAL_POSITION_INT `relative_alt` (meters above home).
     pub relative_alt_m: Option<f64>,
+    pub roll_deg: Option<f32>,
+    pub pitch_deg: Option<f32>,
+    pub yaw_deg: Option<f32>,
+    pub groundspeed_m_s: Option<f32>,
+    pub airspeed_m_s: Option<f32>,
+    pub heading_deg: Option<i16>,
+    pub climb_m_s: Option<f32>,
 }
 
 fn telem_update_from_frame(cache: &mut TelemetryCache, frame: &MavFrame<MavMessage>) {
     match &frame.msg {
         MavMessage::HEARTBEAT(d) if heartbeat_from_autopilot(frame, d.mavtype) => {
             cache.heartbeat_custom_mode = Some(d.custom_mode);
+            cache.mode_name = Some(arducopter_mode_name(d.custom_mode).to_string());
             cache.armed = Some(
                 d.base_mode
                     .contains(MavModeFlag::MAV_MODE_FLAG_SAFETY_ARMED),
             );
+        }
+        MavMessage::ATTITUDE(d) => {
+            cache.roll_deg = Some(d.roll.to_degrees());
+            cache.pitch_deg = Some(d.pitch.to_degrees());
+            cache.yaw_deg = Some(d.yaw.to_degrees());
         }
         MavMessage::GLOBAL_POSITION_INT(d) => {
             cache.lat = Some(d.lat as f64 / 1e7);
             cache.lon = Some(d.lon as f64 / 1e7);
             cache.alt_amsl_m = Some(d.alt as f64 / 1000.0);
             cache.relative_alt_m = Some(d.relative_alt as f64 / 1000.0);
+        }
+        MavMessage::VFR_HUD(d) => {
+            cache.airspeed_m_s = Some(d.airspeed);
+            cache.groundspeed_m_s = Some(d.groundspeed);
+            cache.heading_deg = Some(d.heading);
+            cache.climb_m_s = Some(d.climb);
         }
         MavMessage::HOME_POSITION(d) => {
             cache.home_alt_m = Some(d.altitude as f64 / 1000.0);
@@ -138,14 +191,15 @@ fn telem_update_from_frame(cache: &mut TelemetryCache, frame: &MavFrame<MavMessa
 }
 
 pub fn spawn_http_mavlink_recv_thread<C>(
-    recv_conn: Arc<Mutex<C>>,
+    recv_conn: Arc<C>,
     recv_store: Arc<Mutex<MissionStore>>,
     recv_override: Arc<Mutex<HttpOverrideState>>,
     recv_telem: Arc<Mutex<TelemetryCache>>,
     recv_vehicle_ids: Arc<Mutex<VehicleIds>>,
+    flight_log: FlightLog,
 ) -> thread::JoinHandle<()>
 where
-    C: MavConnection<MavMessage> + Send + 'static,
+    C: MavConnection<MavMessage> + Send + Sync + 'static,
 {
     thread::spawn(move || {
         let mut autopilot_handshake_done = false;
@@ -153,13 +207,27 @@ where
         let mut vehicle_ids = VehicleIds::default();
 
         loop {
-            let frame = match recv_conn.lock().unwrap().recv_frame() {
+            // Do not wrap the connection in an outer Mutex: serial MAVLink uses separate
+            // read/write locks internally; holding one mutex across `recv_frame()` blocks HTTP apply-tool.
+            let frame = match recv_conn.recv_frame() {
                 Ok(f) => f,
                 Err(_) => continue,
             };
 
             if let Ok(mut t) = recv_telem.lock() {
                 telem_update_from_frame(&mut t, &frame);
+            }
+
+            if let MavMessage::STATUSTEXT(d) = &frame.msg {
+                let text = d
+                    .text
+                    .to_str()
+                    .unwrap_or("")
+                    .trim()
+                    .trim_end_matches('\0');
+                if !text.is_empty() {
+                    flight_log.push("info", format!("FC: {text}"));
+                }
             }
 
             if !autopilot_handshake_done {
@@ -171,9 +239,7 @@ where
                         if let Ok(mut g) = recv_vehicle_ids.lock() {
                             *g = vehicle_ids;
                         }
-                        if let Ok(c) = recv_conn.lock() {
-                            refresh_mavlink_streams(&*c, vehicle_ids);
-                        }
+                        refresh_mavlink_streams(recv_conn.as_ref(), vehicle_ids);
                     }
                 }
             }
@@ -201,10 +267,7 @@ where
                             target_component: comp,
                             seq: next_seq,
                         };
-                        let _ = recv_conn
-                            .lock()
-                            .unwrap()
-                            .send_default(&MavMessage::MISSION_REQUEST_INT(req));
+                        let _ = recv_conn.send_default(&MavMessage::MISSION_REQUEST_INT(req));
                     } else {
                         mission_count = None;
                     }
@@ -217,11 +280,11 @@ where
             }
 
             if let MavMessage::MISSION_REQUEST_INT(d) = &frame.msg {
-                if let (Ok(mut store), Ok(conn_lock)) = (recv_store.lock(), recv_conn.lock()) {
+                if let Ok(mut store) = recv_store.lock() {
                     if let Some(mut item) = store.take_upload_item(d.seq) {
                         item.target_system = frame.header.system_id;
                         item.target_component = frame.header.component_id;
-                        let _ = conn_lock.send_default(&MavMessage::MISSION_ITEM_INT(item));
+                        let _ = recv_conn.send_default(&MavMessage::MISSION_ITEM_INT(item));
                     }
                 }
             }
@@ -239,11 +302,9 @@ where
                     if let Ok(mut store) = recv_store.lock() {
                         store.set_upload_done();
                     }
-                    if let Ok(mut conn_lock) = recv_conn.lock() {
-                        let _ = mission_set_current(&mut *conn_lock, vehicle_ids, seq);
-                        let _ = set_mode_auto(&mut *conn_lock, vehicle_ids);
-                        let _ = mission_start(&mut *conn_lock, vehicle_ids);
-                    }
+                    let _ = mission_set_current(recv_conn.as_ref(), vehicle_ids, seq);
+                    let _ = set_mode_auto(recv_conn.as_ref(), vehicle_ids);
+                    let _ = mission_start(recv_conn.as_ref(), vehicle_ids);
                     if let Ok(mut state) = recv_override.lock() {
                         *state = HttpOverrideState::MissionRunning;
                     }
@@ -286,7 +347,7 @@ where
                                         store.set_upload_pending(snapshot_items.clone());
                                     }
                                     let count = snapshot_items.len() as u16;
-                                    let _ = recv_conn.lock().unwrap().send_default(&MavMessage::MISSION_COUNT(
+                                    let _ = recv_conn.send_default(&MavMessage::MISSION_COUNT(
                                         mavlink::ardupilotmega::MISSION_COUNT_DATA {
                                             count,
                                             target_system: vehicle_ids.system_id,
@@ -306,7 +367,7 @@ where
                                 let (wl, wlon, walt) = waypoints[*index];
                                 drop(state_guard);
                                 let msg = goto_global_command_int(vehicle_ids, wl, wlon, walt);
-                                let _ = recv_conn.lock().unwrap().send_default(&msg);
+                                let _ = recv_conn.send_default(&msg);
                             }
                         }
                     }
@@ -329,10 +390,7 @@ where
                             target_component: comp,
                             seq: 0,
                         };
-                        let _ = recv_conn
-                            .lock()
-                            .unwrap()
-                            .send_default(&MavMessage::MISSION_REQUEST_INT(req));
+                        let _ = recv_conn.send_default(&MavMessage::MISSION_REQUEST_INT(req));
                     }
                 }
             }

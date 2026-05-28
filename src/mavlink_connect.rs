@@ -1,7 +1,12 @@
 //! MAVLink connection URL for binaries: default UDP listen or `--serial` to the FC.
+//! When no CLI link args are given, [`open_connection`] tries MAVProxy/UDP then USB serial.
 
-use mavlink::MavConnection;
+use crate::tool_dispatch::wait_autopilot_heartbeat;
+use mavlink::ardupilotmega::MavMessage;
+use mavlink::{connect, Connection, MavConnection};
 use std::io;
+use std::path::Path;
+use std::time::Duration;
 
 /// Accept both MAVLink v1 and v2 (some USB/serial links still emit v1).
 pub fn tune_connection<M: mavlink::Message + Send + Sync>(conn: &mut impl MavConnection<M>) {
@@ -22,6 +27,17 @@ pub enum MavlinkArgsError {
     Help,
     Invalid(String),
 }
+
+/// How the vehicle link was opened (for HTTP / UI).
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct LinkInfo {
+    /// `udp_mavproxy` or `serial_usb`
+    pub kind: String,
+    pub display: String,
+    pub url: String,
+}
+
+const AUTO_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(4);
 
 pub fn default_udp_display() -> &'static str {
     "udp:0.0.0.0:14550 (udpin)"
@@ -162,6 +178,114 @@ pub fn resolve_from_args(
         DEFAULT_UDP_URL.to_string(),
         default_udp_display().to_string(),
     ))
+}
+
+fn serial_device_candidates() -> Vec<String> {
+    let mut out = Vec::new();
+    let mut push = |p: &str| {
+        if Path::new(p).exists() && !out.iter().any(|x| x == p) {
+            out.push(p.to_string());
+        }
+    };
+    push(DEFAULT_SERIAL_DEVICE);
+    if let Ok(entries) = std::fs::read_dir("/dev/serial/by-id") {
+        for ent in entries.flatten() {
+            if let Ok(target) = std::fs::read_link(ent.path()) {
+                if let Some(s) = target.to_str() {
+                    let dev = if s.starts_with("../") {
+                        format!("/dev/{}", s.trim_start_matches("../"))
+                    } else if s.starts_with('/') {
+                        s.to_string()
+                    } else {
+                        continue;
+                    };
+                    push(&dev);
+                }
+            }
+        }
+    }
+    if let Ok(entries) = std::fs::read_dir("/dev") {
+        for ent in entries.flatten() {
+            let name = ent.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("ttyACM") || name.starts_with("ttyUSB") {
+                push(&format!("/dev/{name}"));
+            }
+        }
+    }
+    out
+}
+
+fn try_open_url(
+    url: &str,
+    display: &str,
+    kind: &str,
+    timeout: Duration,
+) -> Result<(Connection<MavMessage>, LinkInfo), ()> {
+    let mut conn = connect::<MavMessage>(url).map_err(|_| ())?;
+    tune_connection(&mut conn);
+    wait_autopilot_heartbeat(&mut conn, timeout).map_err(|_| ())?;
+    Ok((
+        conn,
+        LinkInfo {
+            kind: kind.to_string(),
+            display: display.to_string(),
+            url: url.to_string(),
+        },
+    ))
+}
+
+/// Open MAVLink: explicit CLI args, or auto-detect UDP (MAVProxy) then serial USB.
+pub fn open_connection(
+    args: Vec<String>,
+) -> Result<(Connection<MavMessage>, LinkInfo), String> {
+    if !args.is_empty() {
+        let (url, display) = resolve_from_args(args).map_err(|e| match e {
+            MavlinkArgsError::Help => "help requested".to_string(),
+            MavlinkArgsError::Invalid(m) => m,
+        })?;
+        let kind = if url.starts_with("serial:") {
+            "serial_usb"
+        } else {
+            "udp_mavproxy"
+        };
+        let mut conn = connect::<MavMessage>(&url)
+            .map_err(|e| open_error_message(&url, &e))?;
+        tune_connection(&mut conn);
+        wait_autopilot_heartbeat(&mut conn, Duration::from_secs(60))
+            .map_err(|e| format!("{e}\nLink: {url}"))?;
+        return Ok((
+            conn,
+            LinkInfo {
+                kind: kind.to_string(),
+                display,
+                url,
+            },
+        ));
+    }
+
+    if let Ok(pair) = try_open_url(
+        DEFAULT_UDP_URL,
+        "MAVProxy / UDP (udpin:0.0.0.0:14550)",
+        "udp_mavproxy",
+        AUTO_HEARTBEAT_TIMEOUT,
+    ) {
+        return Ok(pair);
+    }
+
+    for dev in serial_device_candidates() {
+        let url = serial_url(&dev, DEFAULT_SERIAL_BAUD);
+        let display = format!("{url} (USB serial)");
+        if let Ok(pair) = try_open_url(&url, &display, "serial_usb", AUTO_HEARTBEAT_TIMEOUT) {
+            return Ok(pair);
+        }
+    }
+
+    Err(
+        "No MAVLink link: UDP 14550 had no autopilot heartbeat and no serial FC responded.\n\
+         Start MAVProxy forwarding to 14550, or connect Pixhawk USB (/dev/ttyACM0)."
+            .to_string(),
+    )
 }
 
 #[cfg(test)]
