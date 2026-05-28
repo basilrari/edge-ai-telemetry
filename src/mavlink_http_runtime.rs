@@ -29,6 +29,8 @@ pub enum HttpOverrideState {
         resume_after: bool,
     },
     Resuming { resume_seq: u16 },
+    /// Planner upload in progress (wait for MISSION_ACK).
+    Uploading,
 }
 
 impl Default for HttpOverrideState {
@@ -312,6 +314,23 @@ where
                     let _ = mission_start(recv_conn.as_ref(), vehicle_ids);
                     if let Ok(mut state) = recv_override.lock() {
                         *state = HttpOverrideState::MissionRunning;
+                    }
+                } else {
+                    let is_upload = recv_override
+                        .lock()
+                        .map(|g| matches!(*g, HttpOverrideState::Uploading))
+                        .unwrap_or(false);
+                    if is_upload {
+                        if let Ok(mut store) = recv_store.lock() {
+                            if let Some(items) = store.upload_pending.clone() {
+                                store.items = items;
+                                store.current_seq = Some(0);
+                            }
+                            store.set_upload_done();
+                        }
+                        if let Ok(mut state) = recv_override.lock() {
+                            *state = HttpOverrideState::MissionRunning;
+                        }
                     }
                 }
             }

@@ -8,6 +8,7 @@ pub mod mission_store;
 pub mod flight_log;
 pub mod telemetry_hub;
 pub mod mavlink_connect;
+pub mod mission_upload;
 pub mod tool_dispatch;
 
 pub use geo::{horizontal_distance_m, parse_waypoint_input};

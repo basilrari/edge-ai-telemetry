@@ -20,6 +20,7 @@ use futures_util::StreamExt;
 use clap::Parser;
 use drone_server::flight_log::FlightLog;
 use drone_server::http_mission_tools;
+use drone_server::mission_upload::{self, MissionUploadRequest};
 use drone_server::mavlink_connect::{self, LinkInfo};
 use drone_server::mavlink_http_runtime::{
     arducopter_mode_name, spawn_http_mavlink_recv_thread, HttpOverrideState, TelemetryCache,
@@ -280,6 +281,74 @@ async fn get_mission(State(state): State<Arc<AppState>>) -> Json<MissionResponse
         current_seq: store.current_seq,
         waypoints,
     })
+}
+
+#[derive(Serialize)]
+struct MissionUploadResponse {
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    item_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+async fn post_mission_upload(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<MissionUploadRequest>,
+) -> (StatusCode, Json<MissionUploadResponse>) {
+    let rid = request_id_from_headers(&headers);
+    let span = info_span!("drone_http_mission_upload", request_id = %rid);
+    let _enter = span.enter();
+
+    state.flight_log.push("info", "mission_upload: received planner mission");
+
+    let st = Arc::clone(&state);
+    let result = tokio::task::spawn_blocking(move || {
+        let ids = st
+            .vehicle_ids
+            .lock()
+            .map(|g| *g)
+            .map_err(|e| format!("vehicle_ids_lock:{e}"))?;
+        mission_upload::mission_upload(
+            st.conn.as_ref(),
+            ids,
+            &st.mission,
+            &st.override_state,
+            &body,
+        )
+    })
+    .await
+    .unwrap_or_else(|e| Err(format!("spawn_blocking:{e}")));
+
+    match result {
+        Ok(count) => {
+            state.flight_log.push(
+                "info",
+                format!("mission_upload: ok ({count} items on FC)"),
+            );
+            (
+                StatusCode::OK,
+                Json(MissionUploadResponse {
+                    ok: true,
+                    item_count: Some(count),
+                    error: None,
+                }),
+            )
+        }
+        Err(e) => {
+            warn!(request_id = %rid, error = %e, "mission_upload failed");
+            state.flight_log.push("error", format!("mission_upload: {e}"));
+            (
+                StatusCode::BAD_REQUEST,
+                Json(MissionUploadResponse {
+                    ok: false,
+                    item_count: None,
+                    error: Some(e),
+                }),
+            )
+        }
+    }
 }
 
 async fn get_logs(State(state): State<Arc<AppState>>) -> Json<LogsResponse> {
@@ -546,6 +615,7 @@ async fn main() {
         .route("/v1/position", get(get_position))
         .route("/v1/telemetry", get(get_telemetry))
         .route("/v1/mission", get(get_mission))
+        .route("/v1/mission/upload", post(post_mission_upload))
         .route("/v1/logs", get(get_logs))
         .route("/v1/apply-tool", post(post_apply_tool))
         .route("/v1/ws/telemetry", get(ws_telemetry))
