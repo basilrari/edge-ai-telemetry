@@ -11,10 +11,12 @@
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use futures_util::StreamExt;
 use clap::Parser;
 use drone_server::flight_log::FlightLog;
 use drone_server::http_mission_tools;
@@ -22,6 +24,7 @@ use drone_server::mavlink_connect::{self, LinkInfo};
 use drone_server::mavlink_http_runtime::{
     arducopter_mode_name, spawn_http_mavlink_recv_thread, HttpOverrideState, TelemetryCache,
 };
+use drone_server::telemetry_hub::TelemetryHub;
 use drone_server::tool_dispatch::{apply_llm_drone_tool, LLM_DRONE_TOOL_NAMES};
 use drone_server::{MissionStore, VehicleIds};
 use mavlink::ardupilotmega::MavMessage;
@@ -51,6 +54,7 @@ struct AppState {
     override_state: Arc<Mutex<HttpOverrideState>>,
     telem: Arc<Mutex<TelemetryCache>>,
     flight_log: FlightLog,
+    telemetry_hub: TelemetryHub,
 }
 
 fn default_empty_object() -> serde_json::Value {
@@ -284,6 +288,59 @@ async fn get_logs(State(state): State<Arc<AppState>>) -> Json<LogsResponse> {
     })
 }
 
+async fn ws_telemetry(
+    ws: WebSocketUpgrade,
+    State(state): State<Arc<AppState>>,
+) -> impl axum::response::IntoResponse {
+    ws.on_upgrade(move |socket| handle_telemetry_ws(socket, state))
+}
+
+async fn handle_telemetry_ws(mut socket: WebSocket, state: Arc<AppState>) {
+    let mut rx = state.telemetry_hub.subscribe();
+
+    // Immediate snapshot so clients do not wait for next MAVLink frame.
+    let initial = {
+        let t = state.telem.lock().ok();
+        t.map(|g| state.telemetry_hub.snapshot_now(&state.link, &g))
+    };
+    if let Some(snap) = initial {
+        if let Ok(text) = serde_json::to_string(&snap) {
+            if socket.send(Message::Text(text.into())).await.is_err() {
+                return;
+            }
+        }
+    }
+
+    loop {
+        tokio::select! {
+            incoming = socket.recv() => {
+                match incoming {
+                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Ok(Message::Ping(p))) => {
+                        if socket.send(Message::Pong(p)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Err(_)) => break,
+                    _ => {}
+                }
+            }
+            msg = rx.recv() => {
+                match msg {
+                    Ok(snap) => {
+                        let Ok(text) = serde_json::to_string(&snap) else { continue };
+                        if socket.send(Message::Text(text.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(_) => break,
+                }
+            }
+        }
+    }
+}
+
 async fn post_apply_tool(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -449,6 +506,7 @@ async fn main() {
     let mission = Arc::new(Mutex::new(MissionStore::default()));
     let override_state = Arc::new(Mutex::new(HttpOverrideState::default()));
     let telem = Arc::new(Mutex::new(TelemetryCache::default()));
+    let telemetry_hub = TelemetryHub::new();
 
     let _recv_join = spawn_http_mavlink_recv_thread(
         Arc::clone(&conn),
@@ -457,6 +515,8 @@ async fn main() {
         Arc::clone(&telem),
         Arc::clone(&vehicle_ids),
         flight_log.clone(),
+        telemetry_hub.clone(),
+        link.clone(),
     );
 
     let state = Arc::new(AppState {
@@ -467,6 +527,7 @@ async fn main() {
         override_state,
         telem,
         flight_log,
+        telemetry_hub,
     });
 
     let ids_display = vehicle_ids.lock().map(|g| *g).unwrap_or_default();
@@ -487,6 +548,7 @@ async fn main() {
         .route("/v1/mission", get(get_mission))
         .route("/v1/logs", get(get_logs))
         .route("/v1/apply-tool", post(post_apply_tool))
+        .route("/v1/ws/telemetry", get(ws_telemetry))
         .layer(TraceLayer::new_for_http())
         .layer(cors)
         .with_state(state);

@@ -4,6 +4,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use crate::flight_log::FlightLog;
+use crate::mavlink_connect::LinkInfo;
+use crate::telemetry_hub::TelemetryHub;
 use crate::geo::horizontal_distance_m;
 use crate::mavlink_streams::{heartbeat_from_autopilot, refresh_mavlink_streams};
 use crate::{
@@ -197,6 +199,8 @@ pub fn spawn_http_mavlink_recv_thread<C>(
     recv_telem: Arc<Mutex<TelemetryCache>>,
     recv_vehicle_ids: Arc<Mutex<VehicleIds>>,
     flight_log: FlightLog,
+    telemetry_hub: TelemetryHub,
+    link_info: LinkInfo,
 ) -> thread::JoinHandle<()>
 where
     C: MavConnection<MavMessage> + Send + Sync + 'static,
@@ -216,6 +220,7 @@ where
 
             if let Ok(mut t) = recv_telem.lock() {
                 telem_update_from_frame(&mut t, &frame);
+                telemetry_hub.maybe_publish(&link_info, &t);
             }
 
             if let MavMessage::STATUSTEXT(d) = &frame.msg {
