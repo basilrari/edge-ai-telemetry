@@ -40,7 +40,7 @@ pub struct LinkInfo {
 const AUTO_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(4);
 
 pub fn default_udp_display() -> &'static str {
-    "udp:0.0.0.0:14550 (udpin)"
+    "MAVProxy"
 }
 
 pub fn serial_url(device: &str, baud: u32) -> String {
@@ -170,7 +170,7 @@ pub fn resolve_from_args(
             .unwrap_or(DEFAULT_SERIAL_DEVICE);
         let b = baud.unwrap_or(DEFAULT_SERIAL_BAUD);
         let u = serial_url(dev, b);
-        let display = format!("{u} (USB serial)");
+        let display = "Real Drone (Serial)".to_string();
         return Ok((u, display));
     }
 
@@ -266,7 +266,7 @@ pub fn open_connection(
 
     if let Ok(pair) = try_open_url(
         DEFAULT_UDP_URL,
-        "MAVProxy / UDP (udpin:0.0.0.0:14550)",
+        "MAVProxy",
         "udp_mavproxy",
         AUTO_HEARTBEAT_TIMEOUT,
     ) {
@@ -275,7 +275,7 @@ pub fn open_connection(
 
     for dev in serial_device_candidates() {
         let url = serial_url(&dev, DEFAULT_SERIAL_BAUD);
-        let display = format!("{url} (USB serial)");
+        let display = "Real Drone (Serial)".to_string();
         if let Ok(pair) = try_open_url(&url, &display, "serial_usb", AUTO_HEARTBEAT_TIMEOUT) {
             return Ok(pair);
         }

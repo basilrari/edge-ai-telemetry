@@ -117,6 +117,12 @@ struct TelemetryResponse {
     armed: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    home_lat_deg: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    home_lon_deg: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    home_alt_m: Option<f64>,
 }
 
 #[derive(Serialize)]
@@ -228,6 +234,9 @@ async fn get_telemetry(State(state): State<Arc<AppState>>) -> Json<TelemetryResp
                 yaw_deg: None,
                 armed: None,
                 mode: None,
+                home_lat_deg: None,
+                home_lon_deg: None,
+                home_alt_m: None,
             });
         }
     };
@@ -250,6 +259,9 @@ async fn get_telemetry(State(state): State<Arc<AppState>>) -> Json<TelemetryResp
             .mode_name
             .clone()
             .or_else(|| t.heartbeat_custom_mode.map(arducopter_mode_name).map(str::to_string)),
+        home_lat_deg: t.home_lat_deg,
+        home_lon_deg: t.home_lon_deg,
+        home_alt_m: t.home_alt_m,
     })
 }
 
@@ -539,16 +551,12 @@ async fn post_apply_tool(
                     &st.mission,
                     Some(&st.override_state),
                 )?;
-                st.mission
-                    .lock()
-                    .map_err(|e| format!("mission_lock:{e}"))?
-                    .validate_ready_for_start_mission()?;
-                apply_llm_drone_tool(
+                let telem_guard = st.telem.lock().map_err(|e| format!("telem_lock:{e}"))?;
+                mission_upload::start_auto_mission(
                     conn.as_ref(),
                     ids,
-                    "start_mission",
-                    &params_for_blocking,
-                    None,
+                    &st.mission,
+                    &telem_guard,
                 )
             }
             _ => {

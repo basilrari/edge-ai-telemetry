@@ -28,6 +28,12 @@ pub struct TelemetrySnapshot {
     pub yaw_deg: Option<f32>,
     pub armed: Option<bool>,
     pub mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub home_lat_deg: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub home_lon_deg: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub home_alt_m: Option<f64>,
     pub ts_ms: u64,
 }
 
@@ -53,6 +59,9 @@ impl TelemetrySnapshot {
             yaw_deg: t.yaw_deg,
             armed: t.armed,
             mode,
+            home_lat_deg: t.home_lat_deg,
+            home_lon_deg: t.home_lon_deg,
+            home_alt_m: t.home_alt_m,
             ts_ms: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)

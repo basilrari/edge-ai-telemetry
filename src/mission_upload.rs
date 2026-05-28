@@ -4,9 +4,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::cmd::DEFAULT_TAKEOFF_ALTITUDE_M;
-use crate::MissionStore;
-use crate::VehicleIds;
+use crate::{mission_set_current, mission_start, set_mode_auto, MissionStore, VehicleIds};
 use crate::mavlink_http_runtime::HttpOverrideState;
+use crate::mavlink_http_runtime::TelemetryCache;
 use mavlink::ardupilotmega::{
     MavCmd, MavFrame, MavMessage, MISSION_CLEAR_ALL_DATA, MISSION_COUNT_DATA, MISSION_ITEM_INT_DATA,
 };
@@ -340,6 +340,39 @@ pub fn mission_clear<C: MavConnection<MavMessage>>(
     }
 
     Ok(())
+}
+
+const AIRBORNE_MIN_M: f64 = 2.5;
+
+/// AUTO + MISSION_START; when already airborne, skip NAV_TAKEOFF by setting current WP first.
+pub fn start_auto_mission<C: MavConnection<MavMessage>>(
+    conn: &C,
+    ids: VehicleIds,
+    mission: &Arc<Mutex<MissionStore>>,
+    telem: &TelemetryCache,
+) -> Result<(), String> {
+    let items = {
+        let store = mission.lock().map_err(|e| format!("mission_lock:{e}"))?;
+        store.validate_ready_for_start_mission()?;
+        store.items.clone()
+    };
+
+    let airborne = telem
+        .relative_alt_m
+        .map(|a| a > AIRBORNE_MIN_M)
+        .unwrap_or(false);
+    if airborne {
+        if let Some(seq) = items
+            .iter()
+            .find(|it| it.command == MavCmd::MAV_CMD_NAV_WAYPOINT)
+            .map(|it| it.seq)
+        {
+            mission_set_current(conn, ids, seq).map_err(|e| e.to_string())?;
+        }
+    }
+
+    set_mode_auto(conn, ids).map_err(|e| e.to_string())?;
+    mission_start(conn, ids).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]

@@ -144,6 +144,8 @@ pub struct TelemetryCache {
     pub lat: Option<f64>,
     pub lon: Option<f64>,
     pub alt_amsl_m: Option<f64>,
+    pub home_lat_deg: Option<f64>,
+    pub home_lon_deg: Option<f64>,
     pub home_alt_m: Option<f64>,
     pub heartbeat_custom_mode: Option<u32>,
     pub mode_name: Option<String>,
@@ -188,6 +190,8 @@ fn telem_update_from_frame(cache: &mut TelemetryCache, frame: &MavFrame<MavMessa
             cache.climb_m_s = Some(d.climb);
         }
         MavMessage::HOME_POSITION(d) => {
+            cache.home_lat_deg = Some(d.latitude as f64 / 1e7);
+            cache.home_lon_deg = Some(d.longitude as f64 / 1e7);
             cache.home_alt_m = Some(d.altitude as f64 / 1000.0);
         }
         _ => {}
