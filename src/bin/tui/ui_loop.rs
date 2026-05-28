@@ -27,13 +27,6 @@ use crate::telemetry::{
     apply_message, check_pending_feedback_timeout, log_outgoing, log_outgoing_two,
 };
 
-fn mission_has_takeoff(waypoints: &[crate::state::Waypoint]) -> bool {
-    const MAV_CMD_NAV_TAKEOFF: u16 = 22;
-    waypoints
-        .iter()
-        .any(|wp| wp.command == MAV_CMD_NAV_TAKEOFF)
-}
-
 pub(crate) fn run_ui<C: MavConnection<MavMessage> + Send>(
     rx: mpsc::Receiver<MavFrame<MavMessage>>,
     log_rx: mpsc::Receiver<String>,
@@ -224,32 +217,44 @@ pub(crate) fn run_ui<C: MavConnection<MavMessage> + Send>(
                         }
                     }
                     KeyCode::Char('m') => {
-                        if state.mission_waypoints.is_empty() {
-                            state.push_recent(
-                                "Mission start blocked: no mission downloaded yet (wait for MISSION_ITEM_INT)."
-                                    .to_string(),
-                            );
-                            continue 'ui;
-                        }
-                        if !mission_has_takeoff(&state.mission_waypoints) {
-                            let count = state.mission_waypoints.len();
-                            state.push_recent(
-                                format!(
-                                    "Mission start blocked: loaded mission has {} item(s) but no NAV_TAKEOFF.",
-                                    count
-                                ),
-                            );
-                            state.push_recent(
-                                "ArduCopter AUTO requires a TAKEOFF mission item before normal waypoints."
-                                    .to_string(),
-                            );
-                            state.push_recent(
-                                "Fix: edit the mission in your planner to include TAKEOFF, re-upload, then press m again."
-                                    .to_string(),
-                            );
-                            continue 'ui;
-                        }
                         let ids = vehicle_ids_from_state(&state);
+                        {
+                            let store = match mission_store.lock() {
+                                Ok(g) => g,
+                                Err(_) => continue 'ui,
+                            };
+                            if store.items.is_empty() {
+                                state.push_recent(
+                                    "Mission start blocked: no mission downloaded yet (wait for MISSION_ITEM_INT)."
+                                        .to_string(),
+                                );
+                                continue 'ui;
+                            }
+                        }
+                        if let Ok(c) = conn.lock() {
+                            match drone_server::mission_upload::ensure_nav_takeoff_on_fc(
+                                &*c,
+                                ids,
+                                &mission_store,
+                                None,
+                            ) {
+                                Ok(true) => state.push_recent(
+                                    "Inserted NAV_TAKEOFF at mission start and re-uploaded to FC."
+                                        .to_string(),
+                                ),
+                                Ok(false) => {}
+                                Err(e) => {
+                                    state.push_recent(format!("Mission fixup failed: {e}"));
+                                    continue 'ui;
+                                }
+                            }
+                        }
+                        if let Ok(store) = mission_store.lock() {
+                            if let Err(e) = store.validate_ready_for_start_mission() {
+                                state.push_recent(e);
+                                continue 'ui;
+                            }
+                        }
                         if let Ok(mut c) = conn.lock() {
                             let r1 = cmd_set_mode_auto_long(&mut *c, ids);
                             let msg = cmd_mission_start(ids);

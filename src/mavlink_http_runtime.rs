@@ -320,7 +320,11 @@ where
                         .lock()
                         .map(|g| matches!(*g, HttpOverrideState::Uploading))
                         .unwrap_or(false);
-                    if is_upload {
+                    let has_pending = recv_store
+                        .lock()
+                        .map(|s| s.upload_pending.is_some())
+                        .unwrap_or(false);
+                    if is_upload || has_pending {
                         if let Ok(mut store) = recv_store.lock() {
                             if let Some(items) = store.upload_pending.clone() {
                                 store.items = items;
@@ -328,8 +332,10 @@ where
                             }
                             store.set_upload_done();
                         }
-                        if let Ok(mut state) = recv_override.lock() {
-                            *state = HttpOverrideState::MissionRunning;
+                        if is_upload {
+                            if let Ok(mut state) = recv_override.lock() {
+                                *state = HttpOverrideState::MissionRunning;
+                            }
                         }
                     }
                 }

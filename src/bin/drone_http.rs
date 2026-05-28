@@ -16,7 +16,6 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use futures_util::StreamExt;
 use clap::Parser;
 use drone_server::flight_log::FlightLog;
 use drone_server::http_mission_tools;
@@ -351,6 +350,65 @@ async fn post_mission_upload(
     }
 }
 
+#[derive(Serialize)]
+struct MissionClearResponse {
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+async fn post_mission_clear(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> (StatusCode, Json<MissionClearResponse>) {
+    let rid = request_id_from_headers(&headers);
+    let span = info_span!("drone_http_mission_clear", request_id = %rid);
+    let _enter = span.enter();
+
+    state.flight_log.push("info", "mission_clear: clearing FC mission");
+
+    let st = Arc::clone(&state);
+    let result = tokio::task::spawn_blocking(move || {
+        let ids = st
+            .vehicle_ids
+            .lock()
+            .map(|g| *g)
+            .map_err(|e| format!("vehicle_ids_lock:{e}"))?;
+        mission_upload::mission_clear(
+            st.conn.as_ref(),
+            ids,
+            &st.mission,
+            Some(&st.override_state),
+        )
+    })
+    .await
+    .unwrap_or_else(|e| Err(format!("spawn_blocking:{e}")));
+
+    match result {
+        Ok(()) => {
+            state.flight_log.push("info", "mission_clear: ok");
+            (
+                StatusCode::OK,
+                Json(MissionClearResponse {
+                    ok: true,
+                    error: None,
+                }),
+            )
+        }
+        Err(e) => {
+            warn!(request_id = %rid, error = %e, "mission_clear failed");
+            state.flight_log.push("error", format!("mission_clear: {e}"));
+            (
+                StatusCode::BAD_REQUEST,
+                Json(MissionClearResponse {
+                    ok: false,
+                    error: Some(e),
+                }),
+            )
+        }
+    }
+}
+
 async fn get_logs(State(state): State<Arc<AppState>>) -> Json<LogsResponse> {
     Json(LogsResponse {
         entries: state.flight_log.snapshot(),
@@ -475,6 +533,12 @@ async fn post_apply_tool(
                 None,
             ),
             "start_mission" => {
+                mission_upload::ensure_nav_takeoff_on_fc(
+                    conn.as_ref(),
+                    ids,
+                    &st.mission,
+                    Some(&st.override_state),
+                )?;
                 st.mission
                     .lock()
                     .map_err(|e| format!("mission_lock:{e}"))?
@@ -616,6 +680,7 @@ async fn main() {
         .route("/v1/telemetry", get(get_telemetry))
         .route("/v1/mission", get(get_mission))
         .route("/v1/mission/upload", post(post_mission_upload))
+        .route("/v1/mission/clear", post(post_mission_clear))
         .route("/v1/logs", get(get_logs))
         .route("/v1/apply-tool", post(post_apply_tool))
         .route("/v1/ws/telemetry", get(ws_telemetry))

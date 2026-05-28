@@ -185,6 +185,18 @@ where
                     if let Ok(mut state) = recv_override.lock() {
                         *state = OverrideState::MissionRunning;
                     }
+                } else if recv_store
+                    .lock()
+                    .map(|s| s.upload_pending.is_some())
+                    .unwrap_or(false)
+                {
+                    if let Ok(mut store) = recv_store.lock() {
+                        if let Some(items) = store.upload_pending.clone() {
+                            store.items = items;
+                            store.current_seq = Some(0);
+                        }
+                        store.set_upload_done();
+                    }
                 }
             }
 

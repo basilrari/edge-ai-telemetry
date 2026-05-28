@@ -3,10 +3,13 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::cmd::DEFAULT_TAKEOFF_ALTITUDE_M;
 use crate::MissionStore;
 use crate::VehicleIds;
 use crate::mavlink_http_runtime::HttpOverrideState;
-use mavlink::ardupilotmega::{MavCmd, MavFrame, MavMessage, MISSION_COUNT_DATA, MISSION_ITEM_INT_DATA};
+use mavlink::ardupilotmega::{
+    MavCmd, MavFrame, MavMessage, MISSION_CLEAR_ALL_DATA, MISSION_COUNT_DATA, MISSION_ITEM_INT_DATA,
+};
 use mavlink::MavConnection;
 use serde::Deserialize;
 
@@ -66,6 +69,46 @@ fn mission_item_int(
         current: 0,
         autocontinue: 1,
     }
+}
+
+/// Pick a takeoff altitude from existing NAV_WAYPOINT items, else default.
+pub fn infer_takeoff_alt_m(items: &[MISSION_ITEM_INT_DATA]) -> f32 {
+    let mut alts: Vec<f32> = items
+        .iter()
+        .filter(|it| it.command == MavCmd::MAV_CMD_NAV_WAYPOINT)
+        .map(|it| it.z)
+        .filter(|z| z.is_finite() && *z >= MIN_TAKEOFF_ALT_M && *z <= MAX_TAKEOFF_ALT_M)
+        .collect();
+    alts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    alts.first()
+        .copied()
+        .unwrap_or(DEFAULT_TAKEOFF_ALTITUDE_M)
+        .clamp(MIN_TAKEOFF_ALT_M, MAX_TAKEOFF_ALT_M)
+}
+
+/// Insert NAV_TAKEOFF at seq 0 and renumber following items (no-op if already present).
+pub fn prepend_nav_takeoff(
+    items: Vec<MISSION_ITEM_INT_DATA>,
+    ids: VehicleIds,
+    takeoff_alt_m: f32,
+) -> Vec<MISSION_ITEM_INT_DATA> {
+    if MissionStore::items_have_nav_takeoff(&items) {
+        return items;
+    }
+    let alt = takeoff_alt_m.clamp(MIN_TAKEOFF_ALT_M, MAX_TAKEOFF_ALT_M);
+    let mut out = vec![mission_item_int(
+        ids,
+        0,
+        MavCmd::MAV_CMD_NAV_TAKEOFF,
+        0.0,
+        0.0,
+        alt,
+    )];
+    for mut item in items {
+        item.seq = out.len() as u16;
+        out.push(item);
+    }
+    out
 }
 
 pub fn build_mission_items(
@@ -155,14 +198,17 @@ pub fn build_mission_items(
     Ok(items)
 }
 
-pub fn mission_upload<C: MavConnection<MavMessage>>(
+/// Upload pre-built mission items to the FC (shared by planner upload and start_mission fixup).
+pub fn upload_mission_items<C: MavConnection<MavMessage>>(
     conn: &C,
     ids: VehicleIds,
     mission: &Arc<Mutex<MissionStore>>,
-    override_state: &Arc<Mutex<HttpOverrideState>>,
-    req: &MissionUploadRequest,
+    http_override: Option<&Arc<Mutex<HttpOverrideState>>>,
+    items: Vec<MISSION_ITEM_INT_DATA>,
 ) -> Result<usize, String> {
-    let items = build_mission_items(ids, req)?;
+    if items.is_empty() {
+        return Err("mission upload: empty mission".into());
+    }
 
     {
         let store = mission.lock().map_err(|e| format!("mission_lock:{e}"))?;
@@ -171,8 +217,8 @@ pub fn mission_upload<C: MavConnection<MavMessage>>(
         }
     }
 
-    {
-        let mut os = override_state.lock().map_err(|e| format!("override_lock:{e}"))?;
+    if let Some(os_arc) = http_override {
+        let mut os = os_arc.lock().map_err(|e| format!("override_lock:{e}"))?;
         if matches!(&*os, HttpOverrideState::Resuming { .. }) {
             return Err("mission upload: wait for mission resume to finish".into());
         }
@@ -209,9 +255,111 @@ pub fn mission_upload<C: MavConnection<MavMessage>>(
         store.upload_pending = None;
         store.upload_done = false;
     }
-    if let Ok(mut os) = override_state.lock() {
-        *os = HttpOverrideState::MissionRunning;
+    if let Some(os_arc) = http_override {
+        if let Ok(mut os) = os_arc.lock() {
+            *os = HttpOverrideState::MissionRunning;
+        }
     }
 
     Err("mission upload: timed out waiting for MISSION_ACK from flight controller".into())
+}
+
+/// If the FC mission lacks NAV_TAKEOFF, prepend one and re-upload before AUTO mission start.
+pub fn ensure_nav_takeoff_on_fc<C: MavConnection<MavMessage>>(
+    conn: &C,
+    ids: VehicleIds,
+    mission: &Arc<Mutex<MissionStore>>,
+    http_override: Option<&Arc<Mutex<HttpOverrideState>>>,
+) -> Result<bool, String> {
+    let needs_fixup = {
+        let store = mission.lock().map_err(|e| format!("mission_lock:{e}"))?;
+        !store.items.is_empty() && !store.has_nav_takeoff()
+    };
+    if !needs_fixup {
+        return Ok(false);
+    }
+
+    let items = {
+        let store = mission.lock().map_err(|e| format!("mission_lock:{e}"))?;
+        let alt = infer_takeoff_alt_m(&store.items);
+        prepend_nav_takeoff(store.items.clone(), ids, alt)
+    };
+
+    upload_mission_items(conn, ids, mission, http_override, items)?;
+    Ok(true)
+}
+
+pub fn mission_upload<C: MavConnection<MavMessage>>(
+    conn: &C,
+    ids: VehicleIds,
+    mission: &Arc<Mutex<MissionStore>>,
+    override_state: &Arc<Mutex<HttpOverrideState>>,
+    req: &MissionUploadRequest,
+) -> Result<usize, String> {
+    let items = build_mission_items(ids, req)?;
+    upload_mission_items(
+        conn,
+        ids,
+        mission,
+        Some(override_state),
+        items,
+    )
+}
+
+/// Clear all mission items on the flight controller and local mission cache.
+pub fn mission_clear<C: MavConnection<MavMessage>>(
+    conn: &C,
+    ids: VehicleIds,
+    mission: &Arc<Mutex<MissionStore>>,
+    http_override: Option<&Arc<Mutex<HttpOverrideState>>>,
+) -> Result<(), String> {
+    {
+        let store = mission.lock().map_err(|e| format!("mission_lock:{e}"))?;
+        if store.upload_pending.is_some() {
+            return Err("mission clear: wait for mission upload to finish".into());
+        }
+    }
+
+    if let Some(os_arc) = http_override {
+        let mut os = os_arc.lock().map_err(|e| format!("override_lock:{e}"))?;
+        if matches!(&*os, HttpOverrideState::Resuming { .. } | HttpOverrideState::Uploading) {
+            return Err("mission clear: wait for mission transfer to finish".into());
+        }
+        *os = HttpOverrideState::MissionRunning;
+    }
+
+    conn.send_default(&MavMessage::MISSION_CLEAR_ALL(MISSION_CLEAR_ALL_DATA {
+        target_system: ids.system_id,
+        target_component: ids.component_id,
+    }))
+    .map_err(|e| e.to_string())?;
+
+    {
+        let mut store = mission.lock().map_err(|e| format!("mission_lock:{e}"))?;
+        store.clear_local();
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::VehicleIds;
+
+    #[test]
+    fn prepend_takeoff_renumbers_items() {
+        let ids = VehicleIds::default();
+        let wp = mission_item_int(ids, 0, MavCmd::MAV_CMD_NAV_WAYPOINT, 23.0, 120.0, 15.0);
+        let rtl = mission_item_int(ids, 1, MavCmd::MAV_CMD_NAV_RETURN_TO_LAUNCH, 0.0, 0.0, 0.0);
+        let fixed = prepend_nav_takeoff(vec![wp, rtl], ids, 12.0);
+        assert_eq!(fixed.len(), 3);
+        assert_eq!(fixed[0].command, MavCmd::MAV_CMD_NAV_TAKEOFF);
+        assert_eq!(fixed[0].seq, 0);
+        assert_eq!(fixed[0].z, 12.0);
+        assert_eq!(fixed[1].command, MavCmd::MAV_CMD_NAV_WAYPOINT);
+        assert_eq!(fixed[1].seq, 1);
+        assert_eq!(fixed[2].command, MavCmd::MAV_CMD_NAV_RETURN_TO_LAUNCH);
+        assert_eq!(fixed[2].seq, 2);
+    }
 }

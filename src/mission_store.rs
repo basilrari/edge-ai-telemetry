@@ -104,6 +104,15 @@ impl MissionStore {
         self.upload_done = true;
     }
 
+    /// Drop all cached mission state (after FC clear or local reset).
+    pub fn clear_local(&mut self) {
+        self.items.clear();
+        self.current_seq = None;
+        self.snapshot = None;
+        self.upload_pending = None;
+        self.upload_done = false;
+    }
+
     /// Whether we have a snapshot (override was started and not yet resumed).
     pub fn has_snapshot(&self) -> bool {
         self.snapshot.is_some()
@@ -114,6 +123,17 @@ impl MissionStore {
         self.snapshot.as_ref().map(|(a, b)| (a.as_slice(), *b))
     }
 
+    /// Whether the loaded mission includes a NAV_TAKEOFF item (ArduCopter AUTO requirement).
+    pub fn has_nav_takeoff(&self) -> bool {
+        Self::items_have_nav_takeoff(&self.items)
+    }
+
+    pub fn items_have_nav_takeoff(items: &[StoredMissionItem]) -> bool {
+        items
+            .iter()
+            .any(|it| it.command == MavCmd::MAV_CMD_NAV_TAKEOFF)
+    }
+
     /// Same checks as TUI **`m`** before AUTO + MISSION_START: mission downloaded and includes NAV_TAKEOFF.
     pub fn validate_ready_for_start_mission(&self) -> Result<(), String> {
         if self.items.is_empty() {
@@ -122,13 +142,10 @@ impl MissionStore {
                     .to_string(),
             );
         }
-        let has_takeoff = self
-            .items
-            .iter()
-            .any(|it| it.command == MavCmd::MAV_CMD_NAV_TAKEOFF);
-        if !has_takeoff {
+        if !self.has_nav_takeoff() {
             return Err(format!(
-                "start_mission: loaded mission has {} item(s) but no NAV_TAKEOFF (ArduCopter AUTO needs a TAKEOFF item first). TUI shows the same block for key m.",
+                "start_mission: loaded mission has {} item(s) but no NAV_TAKEOFF (ArduCopter AUTO needs a TAKEOFF mission item first). \
+                 A separate takeoff command does not count — re-upload from Mission planner or use start_mission again to auto-insert TAKEOFF.",
                 self.items.len()
             ));
         }
