@@ -152,10 +152,15 @@ where
                 }
             }
 
-            // Upload handshake: FC requested an item during our upload
-            if let MavMessage::MISSION_REQUEST_INT(d) = &frame.msg {
+            let upload_seq = match &frame.msg {
+                MavMessage::MISSION_REQUEST_INT(d) => Some(d.seq),
+                #[allow(deprecated)]
+                MavMessage::MISSION_REQUEST(d) => Some(d.seq),
+                _ => None,
+            };
+            if let Some(seq) = upload_seq {
                 if let (Ok(mut store), Ok(conn_lock)) = (recv_store.lock(), recv_conn.lock()) {
-                    if let Some(mut item) = store.take_upload_item(d.seq) {
+                    if let Some(mut item) = store.take_upload_item(seq) {
                         item.target_system = frame.header.system_id;
                         item.target_component = frame.header.component_id;
                         let _ = conn_lock.send_default(&MavMessage::MISSION_ITEM_INT(item));

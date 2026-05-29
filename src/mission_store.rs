@@ -91,11 +91,14 @@ impl MissionStore {
         self.upload_pending = Some(items);
     }
 
-    /// Get the next item to send for seq (for MISSION_REQUEST_INT response). Returns None if no upload or seq out of range.
-    /// Does not clear upload_pending; that is done in set_upload_done() when MISSION_ACK is received.
+    /// Get the item to send for seq (for MISSION_REQUEST(_INT) response).
     pub fn take_upload_item(&mut self, seq: u16) -> Option<StoredMissionItem> {
         let items = self.upload_pending.as_ref()?;
-        items.get(seq as usize).cloned()
+        items
+            .iter()
+            .find(|it| it.seq == seq)
+            .cloned()
+            .or_else(|| items.get(seq as usize).cloned())
     }
 
     /// Mark upload as done (e.g. on MISSION_ACK). Clears upload_pending.

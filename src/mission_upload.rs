@@ -18,6 +18,9 @@ const MAX_TAKEOFF_ALT_M: f32 = 120.0;
 const MIN_WP_ALT_M: f32 = 2.0;
 const MAX_WP_ALT_M: f32 = 120.0;
 const MAX_WAYPOINTS: usize = 120;
+const UPLOAD_POLL_ITERATIONS: u32 = 300;
+const UPLOAD_POLL_INTERVAL_MS: u64 = 100;
+const UPLOAD_CLEAR_SETTLE_MS: u64 = 300;
 
 #[derive(Debug, Deserialize)]
 pub struct PlannerWaypoint {
@@ -225,6 +228,14 @@ pub fn upload_mission_items<C: MavConnection<MavMessage>>(
         *os = HttpOverrideState::Uploading;
     }
 
+    // Clear any stale FC mission state before a fresh upload (avoids ArduPilot upload timeouts).
+    conn.send_default(&MavMessage::MISSION_CLEAR_ALL(MISSION_CLEAR_ALL_DATA {
+        target_system: ids.system_id,
+        target_component: ids.component_id,
+    }))
+    .map_err(|e| e.to_string())?;
+    std::thread::sleep(Duration::from_millis(UPLOAD_CLEAR_SETTLE_MS));
+
     {
         let mut store = mission.lock().map_err(|e| format!("mission_lock:{e}"))?;
         store.upload_done = false;
@@ -239,8 +250,8 @@ pub fn upload_mission_items<C: MavConnection<MavMessage>>(
     }))
     .map_err(|e| e.to_string())?;
 
-    for _ in 0..150 {
-        std::thread::sleep(Duration::from_millis(100));
+    for _ in 0..UPLOAD_POLL_ITERATIONS {
+        std::thread::sleep(Duration::from_millis(UPLOAD_POLL_INTERVAL_MS));
         let done = mission
             .lock()
             .map_err(|e| format!("mission_lock:{e}"))?
