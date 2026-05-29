@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::cmd::DEFAULT_TAKEOFF_ALTITUDE_M;
-use crate::{mission_set_current, mission_start, set_mode_auto, MissionStore, VehicleIds};
+use crate::{mission_set_current, mission_start, set_mode_auto, MissionStore, VehicleIds, send_gcs, GCS_COMPONENT_ID, GCS_SYSTEM_ID};
 use crate::mavlink_http_runtime::HttpOverrideState;
 use crate::mavlink_http_runtime::TelemetryCache;
 use mavlink::ardupilotmega::{
@@ -21,6 +21,11 @@ const MAX_WAYPOINTS: usize = 120;
 const UPLOAD_POLL_ITERATIONS: u32 = 300;
 const UPLOAD_POLL_INTERVAL_MS: u64 = 100;
 const UPLOAD_CLEAR_ACK_POLLS: u32 = 50;
+
+pub fn mission_request_for_us(target_system: u8, target_component: u8) -> bool {
+    (target_system == 0 || target_system == GCS_SYSTEM_ID)
+        && (target_component == 0 || target_component == GCS_COMPONENT_ID)
+}
 
 #[derive(Debug, Deserialize)]
 pub struct PlannerWaypoint {
@@ -234,7 +239,7 @@ pub fn upload_mission_items<C: MavConnection<MavMessage>>(
         store.awaiting_clear_ack = true;
         store.upload_items_sent = 0;
     }
-    conn.send_default(&MavMessage::MISSION_CLEAR_ALL(MISSION_CLEAR_ALL_DATA {
+    send_gcs(conn, &MavMessage::MISSION_CLEAR_ALL(MISSION_CLEAR_ALL_DATA {
         target_system: ids.system_id,
         target_component: ids.component_id,
     }))
@@ -261,12 +266,22 @@ pub fn upload_mission_items<C: MavConnection<MavMessage>>(
     }
 
     let count = items.len() as u16;
-    conn.send_default(&MavMessage::MISSION_COUNT(MISSION_COUNT_DATA {
+    send_gcs(conn, &MavMessage::MISSION_COUNT(MISSION_COUNT_DATA {
         count,
         target_system: ids.system_id,
         target_component: ids.component_id,
     }))
     .map_err(|e| e.to_string())?;
+
+    if let Some(mut first) = items.first().cloned() {
+        first.target_system = ids.system_id;
+        first.target_component = ids.component_id;
+        if send_gcs(conn, &MavMessage::MISSION_ITEM_INT(first)).is_ok() {
+            if let Ok(mut store) = mission.lock() {
+                store.note_upload_item_sent(0);
+            }
+        }
+    }
 
     for _ in 0..UPLOAD_POLL_ITERATIONS {
         std::thread::sleep(Duration::from_millis(UPLOAD_POLL_INTERVAL_MS));
@@ -371,7 +386,7 @@ pub fn mission_clear<C: MavConnection<MavMessage>>(
         *os = HttpOverrideState::MissionRunning;
     }
 
-    conn.send_default(&MavMessage::MISSION_CLEAR_ALL(MISSION_CLEAR_ALL_DATA {
+    send_gcs(conn, &MavMessage::MISSION_CLEAR_ALL(MISSION_CLEAR_ALL_DATA {
         target_system: ids.system_id,
         target_component: ids.component_id,
     }))
@@ -439,6 +454,14 @@ pub fn start_auto_mission<C: MavConnection<MavMessage>>(
 mod tests {
     use super::*;
     use crate::VehicleIds;
+
+    #[test]
+    fn mission_request_for_us_accepts_gcs_targets() {
+        assert!(mission_request_for_us(255, 190));
+        assert!(mission_request_for_us(255, 0));
+        assert!(mission_request_for_us(0, 190));
+        assert!(!mission_request_for_us(1, 1));
+    }
 
     #[test]
     fn prepend_takeoff_renumbers_items() {

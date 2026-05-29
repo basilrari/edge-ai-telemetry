@@ -8,7 +8,8 @@ use drone_server::{
     geo::horizontal_distance_m,
     goto_global_command_int,
     mavlink_streams::{heartbeat_from_autopilot, refresh_mavlink_streams},
-    mission_set_current, mission_start, set_mode_auto, MissionStore, VehicleIds,
+    mission_set_current, mission_start, mission_upload, send_gcs, set_mode_auto, MissionStore,
+    VehicleIds,
 };
 use mavlink::ardupilotmega::{MavMessage, MavMissionResult};
 use mavlink::{MavConnection, MavFrame};
@@ -153,9 +154,21 @@ where
             }
 
             let upload_seq = match &frame.msg {
-                MavMessage::MISSION_REQUEST_INT(d) => Some(d.seq),
+                MavMessage::MISSION_REQUEST_INT(d) => {
+                    if mission_upload::mission_request_for_us(d.target_system, d.target_component) {
+                        Some(d.seq)
+                    } else {
+                        None
+                    }
+                }
                 #[allow(deprecated)]
-                MavMessage::MISSION_REQUEST(d) => Some(d.seq),
+                MavMessage::MISSION_REQUEST(d) => {
+                    if mission_upload::mission_request_for_us(d.target_system, d.target_component) {
+                        Some(d.seq)
+                    } else {
+                        None
+                    }
+                }
                 _ => None,
             };
             if let Some(seq) = upload_seq {
@@ -163,7 +176,7 @@ where
                     if let Some(mut item) = store.take_upload_item(seq) {
                         item.target_system = frame.header.system_id;
                         item.target_component = frame.header.component_id;
-                        let _ = conn_lock.send_default(&MavMessage::MISSION_ITEM_INT(item));
+                        let _ = send_gcs(&*conn_lock, &MavMessage::MISSION_ITEM_INT(item));
                         store.note_upload_item_sent(seq);
                     }
                 }

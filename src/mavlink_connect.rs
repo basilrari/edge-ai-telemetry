@@ -1,12 +1,18 @@
 //! MAVLink connection URL for binaries: default UDP listen or `--serial` to the FC.
 //! When no CLI link args are given, [`open_connection`] tries MAVProxy/UDP then USB serial.
 
+use crate::mavlink_streams::heartbeat_from_autopilot;
 use crate::tool_dispatch::wait_autopilot_heartbeat;
+use crate::VehicleIds;
 use mavlink::ardupilotmega::MavMessage;
-use mavlink::{connect, Connection, MavConnection};
-use std::io;
+use mavlink::{
+    connect, read_any_msg, Connection, MavConnection, MavFrame, peek_reader::PeekReader, MAV_STX,
+    MAV_STX_V2,
+};
+use std::io::{self, Cursor};
+use std::net::{SocketAddr, UdpSocket};
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Accept both MAVLink v1 and v2 (some USB/serial links still emit v1).
 pub fn tune_connection<M: mavlink::Message + Send + Sync>(conn: &mut impl MavConnection<M>) {
@@ -216,15 +222,102 @@ fn serial_device_candidates() -> Vec<String> {
     out
 }
 
+fn udp_bind_from_url(url: &str) -> Option<String> {
+    url.strip_prefix("udpin:").map(str::to_string)
+}
+
+fn udpout_url(peer: SocketAddr) -> String {
+    format!("udpout:{}", peer)
+}
+
+fn parse_autopilot_heartbeat(buf: &[u8]) -> Option<(u8, u8)> {
+    let start = buf
+        .iter()
+        .position(|b| *b == MAV_STX || *b == MAV_STX_V2)?;
+    let mut cur = PeekReader::new(Cursor::new(&buf[start..]));
+    let (header, msg) = read_any_msg::<MavMessage, _>(&mut cur).ok()?;
+    let frame = MavFrame {
+        header,
+        msg,
+        protocol_version: mavlink::MavlinkVersion::V2,
+    };
+    if let MavMessage::HEARTBEAT(d) = &frame.msg {
+        if heartbeat_from_autopilot(&frame, d.mavtype) {
+            return Some((frame.header.system_id, frame.header.component_id));
+        }
+    }
+    None
+}
+
+/// On `udpin`, learn the autopilot peer address then reconnect as `udpout` so sends are not
+/// redirected to the last UDP packet source (e.g. MAVProxy heartbeats stealing the FC route).
+pub fn discover_autopilot_udp_peer(
+    bind: &str,
+    timeout: Duration,
+) -> Result<(SocketAddr, VehicleIds), String> {
+    let socket = UdpSocket::bind(bind).map_err(|e| format!("udp bind {bind}: {e}"))?;
+    socket
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .map_err(|e| format!("udp timeout: {e}"))?;
+    let deadline = Instant::now() + timeout;
+    let mut buf = [0u8; 2048];
+    while Instant::now() < deadline {
+        match socket.recv_from(&mut buf) {
+            Ok((n, peer)) => {
+                if let Some((sys, comp)) = parse_autopilot_heartbeat(&buf[..n]) {
+                    return Ok((peer, VehicleIds::new(sys, comp)));
+                }
+            }
+            Err(e)
+                if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
+            {
+                continue;
+            }
+            Err(e) => return Err(format!("udp recv on {bind}: {e}")),
+        }
+    }
+    Err(format!(
+        "no autopilot HEARTBEAT on UDP {bind} within {:?}",
+        timeout
+    ))
+}
+
+fn open_udp_pinned_to_autopilot(
+    bind: &str,
+    timeout: Duration,
+) -> Result<(Connection<MavMessage>, LinkInfo, VehicleIds), ()> {
+    let (peer, ids) = discover_autopilot_udp_peer(bind, timeout).map_err(|_| ())?;
+    let url = udpout_url(peer);
+    let mut conn = connect::<MavMessage>(&url).map_err(|_| ())?;
+    tune_connection(&mut conn);
+    let verified = wait_autopilot_heartbeat(&conn, Duration::from_secs(2)).ok();
+    if verified.is_none() {
+        return Err(());
+    }
+    Ok((
+        conn,
+        LinkInfo {
+            kind: "udp_mavproxy".to_string(),
+            display: format!("MAVProxy → {peer}"),
+            url,
+        },
+        ids,
+    ))
+}
 fn try_open_url(
     url: &str,
     display: &str,
     kind: &str,
     timeout: Duration,
 ) -> Result<(Connection<MavMessage>, LinkInfo), ()> {
+    if let Some(bind) = udp_bind_from_url(url) {
+        if let Ok((conn, link, _ids)) = open_udp_pinned_to_autopilot(&bind, timeout) {
+            return Ok((conn, link));
+        }
+    }
     let mut conn = connect::<MavMessage>(url).map_err(|_| ())?;
     tune_connection(&mut conn);
-    wait_autopilot_heartbeat(&mut conn, timeout).map_err(|_| ())?;
+    wait_autopilot_heartbeat(&conn, timeout).map_err(|_| ())?;
     Ok((
         conn,
         LinkInfo {
@@ -249,6 +342,11 @@ pub fn open_connection(
         } else {
             "udp_mavproxy"
         };
+        if let Some(bind) = udp_bind_from_url(&url) {
+            let (conn, link, _ids) = open_udp_pinned_to_autopilot(&bind, Duration::from_secs(60))
+                .map_err(|_| format!("no autopilot on UDP {bind} (MAVProxy forwarding?)"))?;
+            return Ok((conn, link));
+        }
         let mut conn = connect::<MavMessage>(&url)
             .map_err(|e| open_error_message(&url, &e))?;
         tune_connection(&mut conn);

@@ -1,7 +1,27 @@
 //! Helpers that build ArduPilotMega MAVLink command messages.
 
 use mavlink::ardupilotmega::{COMMAND_INT_DATA, COMMAND_LONG_DATA, MavCmd, MavFrame, MavMessage};
-use mavlink::MavConnection;
+use mavlink::{MavConnection, MavHeader};
+
+/// Standard GCS identity (matches ArduPilot `SYSID_MYGCS` default and Mission Planner component).
+pub const GCS_SYSTEM_ID: u8 = 255;
+pub const GCS_COMPONENT_ID: u8 = 190;
+
+pub fn gcs_header() -> MavHeader {
+    MavHeader {
+        system_id: GCS_SYSTEM_ID,
+        component_id: GCS_COMPONENT_ID,
+        sequence: 0,
+    }
+}
+
+/// Send with explicit GCS header (avoids ambiguous component id 0 on mission protocol).
+pub fn send_gcs<C>(conn: &C, msg: &MavMessage) -> Result<usize, mavlink::error::MessageWriteError>
+where
+    C: MavConnection<MavMessage>,
+{
+    conn.send(&gcs_header(), msg)
+}
 
 /// `MAV_CMD_DO_SET_MODE` param1: select custom mode (ArduPilot convention).
 const MAV_MODE_FLAG_CUSTOM_MODE_ENABLED: f32 = 1.0;

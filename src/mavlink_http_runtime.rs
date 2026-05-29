@@ -8,9 +8,10 @@ use crate::mavlink_connect::LinkInfo;
 use crate::telemetry_hub::TelemetryHub;
 use crate::geo::horizontal_distance_m;
 use crate::mavlink_streams::{heartbeat_from_autopilot, refresh_mavlink_streams};
+use crate::mission_upload::mission_request_for_us;
 use crate::{
     goto_global_command_int, mission_set_current, mission_start, resume_mission_execution,
-    set_mode_auto, MissionStore, VehicleIds,
+    send_gcs, set_mode_auto, MissionStore, VehicleIds,
 };
 use mavlink::ardupilotmega::{MavMessage, MavModeFlag, MavMissionResult};
 use mavlink::{MavConnection, MavFrame};
@@ -323,18 +324,38 @@ where
             }
 
             let upload_seq = match &frame.msg {
-                MavMessage::MISSION_REQUEST_INT(d) => Some(d.seq),
+                MavMessage::MISSION_REQUEST_INT(d) => {
+                    if mission_request_for_us(d.target_system, d.target_component) {
+                        Some(d.seq)
+                    } else {
+                        None
+                    }
+                }
                 #[allow(deprecated)]
-                MavMessage::MISSION_REQUEST(d) => Some(d.seq),
+                MavMessage::MISSION_REQUEST(d) => {
+                    if mission_request_for_us(d.target_system, d.target_component) {
+                        Some(d.seq)
+                    } else {
+                        None
+                    }
+                }
                 _ => None,
             };
             if let Some(seq) = upload_seq {
                 if let Ok(mut store) = recv_store.lock() {
+                    if store.upload_pending.is_some() {
+                        flight_log.push_flight(
+                            "info",
+                            format!(
+                                "mission upload: FC requested seq {seq} (sys={} comp={})",
+                                frame.header.system_id, frame.header.component_id
+                            ),
+                        );
+                    }
                     if let Some(mut item) = store.take_upload_item(seq) {
                         item.target_system = frame.header.system_id;
                         item.target_component = frame.header.component_id;
-                        if recv_conn
-                            .send_default(&MavMessage::MISSION_ITEM_INT(item))
+                        if send_gcs(recv_conn.as_ref(), &MavMessage::MISSION_ITEM_INT(item))
                             .is_ok()
                         {
                             store.note_upload_item_sent(seq);
