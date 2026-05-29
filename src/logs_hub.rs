@@ -14,6 +14,8 @@ use mavlink::MavFrame;
 
 const MAX_FLIGHT: usize = 500;
 const MAX_MAVLINK: usize = 800;
+/// Entries older than this are dropped from memory (24 hours).
+const LOG_RETENTION_MS: u64 = 24 * 60 * 60 * 1000;
 
 const HIGH_RATE_MIN_INTERVAL: Duration = Duration::from_millis(900);
 
@@ -62,7 +64,8 @@ impl LogsHub {
     }
 
     pub fn snapshot_ws(&self) -> LogWsMessage {
-        let inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap();
+        prune_expired(&mut inner);
         LogWsMessage::Snapshot {
             flight: inner.flight.iter().cloned().collect(),
             mavlink: inner.mavlink.iter().cloned().collect(),
@@ -72,14 +75,20 @@ impl LogsHub {
     pub fn flight_snapshot(&self) -> Vec<FlightLogEntry> {
         self.inner
             .lock()
-            .map(|q| q.flight.iter().cloned().collect())
+            .map(|mut q| {
+                prune_expired(&mut q);
+                q.flight.iter().cloned().collect()
+            })
             .unwrap_or_default()
     }
 
     pub fn mavlink_snapshot(&self) -> Vec<MavlinkLogEntry> {
         self.inner
             .lock()
-            .map(|q| q.mavlink.iter().cloned().collect())
+            .map(|mut q| {
+                prune_expired(&mut q);
+                q.mavlink.iter().cloned().collect()
+            })
             .unwrap_or_default()
     }
 
@@ -92,6 +101,7 @@ impl LogsHub {
         };
         if let Ok(mut inner) = self.inner.lock() {
             inner.flight.push_back(entry.clone());
+            prune_expired(&mut inner);
             while inner.flight.len() > MAX_FLIGHT {
                 inner.flight.pop_front();
             }
@@ -108,6 +118,7 @@ impl LogsHub {
         }
         if let Ok(mut inner) = self.inner.lock() {
             inner.mavlink.push_back(entry.clone());
+            prune_expired(&mut inner);
             while inner.mavlink.len() > MAX_MAVLINK {
                 inner.mavlink.pop_front();
             }
@@ -143,4 +154,26 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+fn retention_cutoff_ms() -> u64 {
+    now_ms().saturating_sub(LOG_RETENTION_MS)
+}
+
+fn prune_expired(inner: &mut LogsHubInner) {
+    let cutoff = retention_cutoff_ms();
+    while inner
+        .flight
+        .front()
+        .is_some_and(|e| e.ts_ms < cutoff)
+    {
+        inner.flight.pop_front();
+    }
+    while inner
+        .mavlink
+        .front()
+        .is_some_and(|e| e.ts_ms < cutoff)
+    {
+        inner.mavlink.pop_front();
+    }
 }
