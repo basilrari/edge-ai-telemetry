@@ -5,8 +5,8 @@
 ## Role in the larger project
 
 - In the [workspace architecture](../README.md), **Drone Server** sits between higher-level software (Gateway, LLM, frontend) and the **flight controller**. It turns structured intent—arm, modes, RTL, waypoints, mission control—into MAVLink frames the FC understands.
-- **Today:** library + `tui` + `raw`. **Tomorrow:** an HTTP or WebSocket API (or in-process calls) can wrap the same library so the Gateway does not need its own MAVLink stack for basic commands.
-- Longer-term control story: [ROADMAP.md](ROADMAP.md) (remote control → waypoint injection → autonomous path → override → resume → LLM integration).
+- **Today:** library + **`drone-http`** + `tui` + `raw`. The Gateway and frontend use **`drone-http`** on port 3001 (proxied at gateway `:3000`).
+- Longer-term control story is tracked outside this repo (see git history / issues).
 
 ---
 
@@ -82,40 +82,61 @@ cargo run --bin tui -- --serial /dev/ttyACM0 --baud 921600
 
 ---
 
+## Integration
+
+- **`drone-http`** (binary `drone-http`, default port **3001**) is the HTTP/WebSocket API used by the **Gateway** and **frontend** (via gateway proxies). It wraps the same MAVLink runtime as the TUI.
+- **`tui`** and **`raw`** remain for field debugging and override/resume workflows not exposed in the web UI.
+- For system-wide context (frontend, gateway, model server), see **Code/README.md**.
+
+### `drone-http` endpoints (summary)
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| GET | `/health` | Liveness |
+| GET | `/v1/telemetry` | Latest HUD fields |
+| GET | `/v1/position` | Lat/lon for map |
+| GET | `/v1/mission` | FC mission waypoints |
+| POST | `/v1/mission/upload` | Upload mission |
+| POST | `/v1/mission/clear` | Clear FC mission |
+| POST | `/v1/apply-tool` | Execute drone tool |
+| GET | `/v1/logs` | Flight event log |
+| GET | `/v1/logs/mavlink` | MAVLink log snapshot |
+| WS | `/v1/ws/telemetry` | Live telemetry |
+| WS | `/v1/ws/logs` | Live flight + MAVLink logs |
+
+---
+
 ## Repository layout
 
 ```
 drone-server/
-├── Cargo.toml              # default-run = "tui"; explicit [[bin]] path for tui
+├── Cargo.toml              # default-run = "tui"; bins: tui, drone-http, raw
 ├── README.md               # This file
 ├── AGENTS.md               # Maintainer/agent-oriented map of the crate
-├── ROADMAP.md
-├── OVERRIDE_RESUME_BRAINSTORM.md
 └── src/
     ├── lib.rs              # Crate root: modules + public re-exports
     ├── cmd.rs              # MAVLink command builders and send helpers
     ├── mission.rs          # Serde mission types
     ├── mission_store.rs    # FC mission mirror + override snapshot/upload state
     ├── mavlink_connect.rs  # URL resolution, CLI help, connection tuning
+    ├── flight_log.rs       # Flight event log entries
+    ├── mavlink_log.rs      # MAVLink row formatting for dashboard
+    ├── logs_hub.rs         # Combined log buffers + WS broadcast
+    ├── telemetry_hub.rs    # Telemetry snapshot for HTTP/WS
+    ├── mavlink_http_runtime.rs
+    ├── http_mission_tools.rs
+    ├── mission_upload.rs
+    ├── tool_dispatch.rs
+    ├── mavlink_streams.rs
+    ├── geo.rs
     └── bin/
+        ├── drone_http.rs   # HTTP/WS API (production)
         ├── raw.rs          # Console telemetry binary
-        └── tui/            # TUI binary split into modules (single crate binary)
-            ├── main.rs     # Entry: connect, channels, spawn threads, run UI
-            ├── ui_loop.rs  # Raw mode, key handling, frame drain, draw cadence
-            ├── recv.rs     # MAVLink recv thread: handshake, streams, mission, override
-            ├── render.rs   # ratatui layout and widgets
-            ├── telemetry.rs # apply_message, outgoing log + pending FC feedback
-            ├── state.rs    # TelemetryState, OverrideState, coverage, watchdog mirror
-            ├── mavlink_cmd.rs # Local COMMAND_LONG builders + stream rate requests
-            ├── format.rs   # Pure string/format helpers for UI and telemetry
-            ├── geo.rs      # Waypoint parsing, geodesic distance for override
-            ├── consts.rs   # MSG IDs, thresholds, retry timing
-            └── watchdog.rs # Internet probe + failsafe RTL thread
+        └── tui/            # TUI binary
 ```
 
 ---
 
-## Integration and future API
+## Older docs
 
-- This crate **does not** expose HTTP/WebSocket endpoints. The **Gateway** (separate crate under the workspace) owns HTTP routes today; future work is to call into `drone_server` or a small sidecar process for real vehicle control.
-- For system-wide context (frontend, gateway, model server), keep **Code/README.md** as the top-level map.
+Planning notes (`ROADMAP.md`, `OVERRIDE_RESUME_BRAINSTORM.md`) are not in this tree; see git history or issue tracker if needed.
