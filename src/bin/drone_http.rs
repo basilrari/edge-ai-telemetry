@@ -17,7 +17,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use clap::Parser;
-use drone_server::flight_log::FlightLog;
+use drone_server::logs_hub::LogsHub;
 use drone_server::http_mission_tools;
 use drone_server::mission_upload::{self, MissionUploadRequest};
 use drone_server::mavlink_connect::{self, LinkInfo};
@@ -53,7 +53,7 @@ struct AppState {
     mission: Arc<Mutex<MissionStore>>,
     override_state: Arc<Mutex<HttpOverrideState>>,
     telem: Arc<Mutex<TelemetryCache>>,
-    flight_log: FlightLog,
+    logs: LogsHub,
     telemetry_hub: TelemetryHub,
 }
 
@@ -332,7 +332,7 @@ async fn post_mission_upload(
     let span = info_span!("drone_http_mission_upload", request_id = %rid);
     let _enter = span.enter();
 
-    state.flight_log.push("info", "mission_upload: received planner mission");
+    state.logs.push_flight("info", "mission_upload: received planner mission");
 
     let st = Arc::clone(&state);
     let result = tokio::task::spawn_blocking(move || {
@@ -354,7 +354,7 @@ async fn post_mission_upload(
 
     match result {
         Ok(count) => {
-            state.flight_log.push(
+            state.logs.push_flight(
                 "info",
                 format!("mission_upload: ok ({count} items on FC)"),
             );
@@ -369,7 +369,7 @@ async fn post_mission_upload(
         }
         Err(e) => {
             warn!(request_id = %rid, error = %e, "mission_upload failed");
-            state.flight_log.push("error", format!("mission_upload: {e}"));
+            state.logs.push_flight("error", format!("mission_upload: {e}"));
             (
                 StatusCode::BAD_REQUEST,
                 Json(MissionUploadResponse {
@@ -397,7 +397,7 @@ async fn post_mission_clear(
     let span = info_span!("drone_http_mission_clear", request_id = %rid);
     let _enter = span.enter();
 
-    state.flight_log.push("info", "mission_clear: clearing FC mission");
+    state.logs.push_flight("info", "mission_clear: clearing FC mission");
 
     let st = Arc::clone(&state);
     let result = tokio::task::spawn_blocking(move || {
@@ -418,7 +418,7 @@ async fn post_mission_clear(
 
     match result {
         Ok(()) => {
-            state.flight_log.push("info", "mission_clear: ok");
+            state.logs.push_flight("info", "mission_clear: ok");
             (
                 StatusCode::OK,
                 Json(MissionClearResponse {
@@ -429,7 +429,7 @@ async fn post_mission_clear(
         }
         Err(e) => {
             warn!(request_id = %rid, error = %e, "mission_clear failed");
-            state.flight_log.push("error", format!("mission_clear: {e}"));
+            state.logs.push_flight("error", format!("mission_clear: {e}"));
             (
                 StatusCode::BAD_REQUEST,
                 Json(MissionClearResponse {
@@ -443,8 +443,65 @@ async fn post_mission_clear(
 
 async fn get_logs(State(state): State<Arc<AppState>>) -> Json<LogsResponse> {
     Json(LogsResponse {
-        entries: state.flight_log.snapshot(),
+        entries: state.logs.flight_snapshot(),
     })
+}
+
+#[derive(Serialize)]
+struct MavlinkLogsResponse {
+    entries: Vec<drone_server::mavlink_log::MavlinkLogEntry>,
+}
+
+async fn get_mavlink_logs(State(state): State<Arc<AppState>>) -> Json<MavlinkLogsResponse> {
+    Json(MavlinkLogsResponse {
+        entries: state.logs.mavlink_snapshot(),
+    })
+}
+
+async fn ws_logs(
+    ws: WebSocketUpgrade,
+    State(state): State<Arc<AppState>>,
+) -> impl axum::response::IntoResponse {
+    ws.on_upgrade(move |socket| handle_logs_ws(socket, state))
+}
+
+async fn handle_logs_ws(mut socket: WebSocket, state: Arc<AppState>) {
+    let mut rx = state.logs.subscribe();
+    let snap = state.logs.snapshot_ws();
+    if let Ok(text) = serde_json::to_string(&snap) {
+        if socket.send(Message::Text(text.into())).await.is_err() {
+            return;
+        }
+    }
+
+    loop {
+        tokio::select! {
+            incoming = socket.recv() => {
+                match incoming {
+                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Ok(Message::Ping(p))) => {
+                        if socket.send(Message::Pong(p)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Err(_)) => break,
+                    _ => {}
+                }
+            }
+            msg = rx.recv() => {
+                match msg {
+                    Ok(ev) => {
+                        let Ok(text) = serde_json::to_string(&ev) else { continue };
+                        if socket.send(Message::Text(text.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(_) => break,
+                }
+            }
+        }
+    }
 }
 
 async fn ws_telemetry(
@@ -518,7 +575,7 @@ async fn post_apply_tool(
         tool = %body.tool,
         "apply_tool: received HTTP request"
     );
-    state.flight_log.push(
+    state.logs.push_flight(
         "info",
         format!("apply_tool: {} params={}", body.tool, body.params),
     );
@@ -596,12 +653,12 @@ async fn post_apply_tool(
     let (ok, err) = match result {
         Ok(Ok(())) => {
             info!(request_id = %rid, tool = %tool_name_for_log, "apply_tool: MAVLink send OK");
-            state.flight_log.push("info", format!("OK: {tool_name_for_log}"));
+            state.logs.push_flight("info", format!("OK: {tool_name_for_log}"));
             (true, None)
         }
         Ok(Err(e)) => {
             warn!(request_id = %rid, tool = %tool_name_for_log, error = %e, "apply_tool: MAVLink or tool error");
-            state.flight_log.push("warn", format!("FAIL {tool_name_for_log}: {e}"));
+            state.logs.push_flight("warn", format!("FAIL {tool_name_for_log}: {e}"));
             (false, Some(e))
         }
         Err(join_err) => {
@@ -645,7 +702,7 @@ async fn main() {
         std::process::exit(0);
     }
 
-    let flight_log = FlightLog::new();
+    let logs = LogsHub::new();
     let (connection, link) = match mavlink_connect::open_connection(args.mavlink.clone()) {
         Ok(v) => v,
         Err(e) => {
@@ -654,7 +711,7 @@ async fn main() {
         }
     };
     info!(url = %link.url, kind = %link.kind, display = %link.display, "MAVLink connected");
-    flight_log.push("info", format!("Link: {} ({})", link.display, link.kind));
+    logs.push_flight("info", format!("Link: {} ({})", link.display, link.kind));
 
     let conn = Arc::new(connection);
     let vehicle_ids = Arc::new(Mutex::new(VehicleIds::new(1, 1)));
@@ -669,7 +726,7 @@ async fn main() {
         Arc::clone(&override_state),
         Arc::clone(&telem),
         Arc::clone(&vehicle_ids),
-        flight_log.clone(),
+        logs.clone(),
         telemetry_hub.clone(),
         link.clone(),
     );
@@ -681,7 +738,7 @@ async fn main() {
         mission,
         override_state,
         telem,
-        flight_log,
+        logs,
         telemetry_hub,
     });
 
@@ -704,8 +761,10 @@ async fn main() {
         .route("/v1/mission/upload", post(post_mission_upload))
         .route("/v1/mission/clear", post(post_mission_clear))
         .route("/v1/logs", get(get_logs))
+        .route("/v1/logs/mavlink", get(get_mavlink_logs))
         .route("/v1/apply-tool", post(post_apply_tool))
         .route("/v1/ws/telemetry", get(ws_telemetry))
+        .route("/v1/ws/logs", get(ws_logs))
         .layer(TraceLayer::new_for_http())
         .layer(cors)
         .with_state(state);

@@ -3,7 +3,7 @@
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use crate::flight_log::FlightLog;
+use crate::logs_hub::LogsHub;
 use crate::mavlink_connect::LinkInfo;
 use crate::telemetry_hub::TelemetryHub;
 use crate::geo::horizontal_distance_m;
@@ -221,7 +221,7 @@ pub fn spawn_http_mavlink_recv_thread<C>(
     recv_override: Arc<Mutex<HttpOverrideState>>,
     recv_telem: Arc<Mutex<TelemetryCache>>,
     recv_vehicle_ids: Arc<Mutex<VehicleIds>>,
-    flight_log: FlightLog,
+    flight_log: LogsHub,
     telemetry_hub: TelemetryHub,
     link_info: LinkInfo,
 ) -> thread::JoinHandle<()>
@@ -246,6 +246,8 @@ where
                 telemetry_hub.maybe_publish(&link_info, &t);
             }
 
+            flight_log.log_mavlink_frame(&frame);
+
             if let MavMessage::STATUSTEXT(d) = &frame.msg {
                 let text = d
                     .text
@@ -254,7 +256,7 @@ where
                     .trim()
                     .trim_end_matches('\0');
                 if !text.is_empty() {
-                    flight_log.push("info", format!("FC: {text}"));
+                    flight_log.push_flight("info", format!("FC: {text}"));
                 }
             }
 

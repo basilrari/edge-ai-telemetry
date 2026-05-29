@@ -6,6 +6,8 @@ pub mod mavlink_http_runtime;
 pub mod mavlink_streams;
 pub mod mission_store;
 pub mod flight_log;
+pub mod logs_hub;
+pub mod mavlink_log;
 pub mod telemetry_hub;
 pub mod mavlink_connect;
 pub mod mission_upload;
