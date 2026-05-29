@@ -264,7 +264,7 @@ pub fn upload_mission_items<C: MavConnection<MavMessage>>(
     Err("mission upload: timed out waiting for MISSION_ACK from flight controller".into())
 }
 
-/// If the FC mission lacks NAV_TAKEOFF, prepend one and re-upload before AUTO mission start.
+/// If the FC mission lacks NAV_TAKEOFF, prepend one and re-upload (Mission Planner / TUI `m` only — not LLM prompts).
 pub fn ensure_nav_takeoff_on_fc<C: MavConnection<MavMessage>>(
     conn: &C,
     ids: VehicleIds,

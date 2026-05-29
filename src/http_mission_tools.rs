@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::geo::parse_waypoint_input;
 use crate::goto_global_command_int;
+use crate::resume_mission_execution;
 use crate::set_mode_guided;
 use crate::MissionStore;
 use crate::VehicleIds;
@@ -69,17 +70,18 @@ pub fn mission_interrupt<C: MavConnection<MavMessage>>(
     Ok(())
 }
 
-/// Resume mission after interrupt (TUI `c`): `MISSION_COUNT` upload handshake; recv thread completes on `MISSION_ACK`.
+/// Resume mission after interrupt: AUTO + current item + MISSION_START on the **existing FC mission**
+/// (no mission upload — waypoints change only via Mission Planner HTTP upload/clear).
 pub fn mission_resume<C: MavConnection<MavMessage>>(
     conn: &C,
     ids: VehicleIds,
     mission: &Arc<Mutex<MissionStore>>,
     override_state: &Arc<Mutex<HttpOverrideState>>,
 ) -> Result<(), String> {
-    let (snapshot_items, resume_seq) = {
+    let resume_seq = {
         let store = mission.lock().map_err(|e| format!("mission_lock:{e}"))?;
         match store.get_snapshot() {
-            Some((items, seq)) => (items.to_vec(), seq),
+            Some((_, seq)) => seq,
             None => {
                 let mut os = override_state.lock().map_err(|e| format!("override_lock:{e}"))?;
                 if !matches!(*os, HttpOverrideState::MissionRunning) {
@@ -94,24 +96,11 @@ pub fn mission_resume<C: MavConnection<MavMessage>>(
         }
     };
 
-    {
-        let mut store = mission.lock().map_err(|e| format!("mission_lock:{e}"))?;
-        store.set_upload_pending(snapshot_items.clone());
-    }
-    let count = snapshot_items.len() as u16;
-    conn.send_default(&MavMessage::MISSION_COUNT(
-        mavlink::ardupilotmega::MISSION_COUNT_DATA {
-            count,
-            target_system: ids.system_id,
-            target_component: ids.component_id,
-        },
-    ))
-    .map(|_| ())
-    .map_err(|e| e.to_string())?;
+    resume_mission_execution(conn, ids, resume_seq)?;
 
     {
         let mut os = override_state.lock().map_err(|e| format!("override_lock:{e}"))?;
-        *os = HttpOverrideState::Resuming { resume_seq };
+        *os = HttpOverrideState::MissionRunning;
     }
     Ok(())
 }

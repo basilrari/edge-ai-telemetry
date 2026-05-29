@@ -291,3 +291,13 @@ where
 {
     conn.send_default(&mission_start_message(ids)).map(|_| ())
 }
+
+/// Resume AUTO mission on the FC without uploading mission items (prompt/override path only).
+pub fn resume_mission_execution<C>(conn: &C, ids: VehicleIds, resume_seq: u16) -> Result<(), String>
+where
+    C: MavConnection<MavMessage>,
+{
+    set_mode_auto(conn, ids).map_err(|e| e.to_string())?;
+    mission_set_current(conn, ids, resume_seq).map_err(|e| e.to_string())?;
+    mission_start(conn, ids).map_err(|e| e.to_string())
+}

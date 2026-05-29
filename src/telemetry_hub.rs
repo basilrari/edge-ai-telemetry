@@ -34,6 +34,14 @@ pub struct TelemetrySnapshot {
     pub home_lon_deg: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub home_alt_m: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub battery_voltage_v: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub battery_current_a: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub battery_power_w: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub battery_remaining_pct: Option<i8>,
     pub ts_ms: u64,
 }
 
@@ -43,6 +51,10 @@ impl TelemetrySnapshot {
             .mode_name
             .clone()
             .or_else(|| t.heartbeat_custom_mode.map(|m| arducopter_mode_name(m).to_string()));
+        let battery_power_w = match (t.battery_voltage_v, t.battery_current_a) {
+            (Some(v), Some(a)) if v.is_finite() && a.is_finite() => Some(v * a),
+            _ => None,
+        };
         Self {
             ok: t.lat.is_some() && t.lon.is_some(),
             link: link.clone(),
@@ -62,6 +74,10 @@ impl TelemetrySnapshot {
             home_lat_deg: t.home_lat_deg,
             home_lon_deg: t.home_lon_deg,
             home_alt_m: t.home_alt_m,
+            battery_voltage_v: t.battery_voltage_v,
+            battery_current_a: t.battery_current_a,
+            battery_power_w,
+            battery_remaining_pct: t.battery_remaining_pct,
             ts_ms: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)

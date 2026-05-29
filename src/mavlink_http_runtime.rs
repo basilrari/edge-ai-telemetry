@@ -9,8 +9,8 @@ use crate::telemetry_hub::TelemetryHub;
 use crate::geo::horizontal_distance_m;
 use crate::mavlink_streams::{heartbeat_from_autopilot, refresh_mavlink_streams};
 use crate::{
-    goto_global_command_int, mission_set_current, mission_start, set_mode_auto, MissionStore,
-    VehicleIds,
+    goto_global_command_int, mission_set_current, mission_start, resume_mission_execution,
+    set_mode_auto, MissionStore, VehicleIds,
 };
 use mavlink::ardupilotmega::{MavMessage, MavModeFlag};
 use mavlink::{MavConnection, MavFrame};
@@ -160,6 +160,12 @@ pub struct TelemetryCache {
     pub airspeed_m_s: Option<f32>,
     pub heading_deg: Option<i16>,
     pub climb_m_s: Option<f32>,
+    /// Pack voltage from SYS_STATUS (same ÷100 scale as TUI/raw).
+    pub battery_voltage_v: Option<f32>,
+    /// Pack current in amps from SYS_STATUS `current_battery` (centi-amps).
+    pub battery_current_a: Option<f32>,
+    /// Remaining capacity percent when reported (0–100).
+    pub battery_remaining_pct: Option<i8>,
 }
 
 fn telem_update_from_frame(cache: &mut TelemetryCache, frame: &MavFrame<MavMessage>) {
@@ -188,6 +194,17 @@ fn telem_update_from_frame(cache: &mut TelemetryCache, frame: &MavFrame<MavMessa
             cache.groundspeed_m_s = Some(d.groundspeed);
             cache.heading_deg = Some(d.heading);
             cache.climb_m_s = Some(d.climb);
+        }
+        MavMessage::SYS_STATUS(d) => {
+            if d.voltage_battery != u16::MAX {
+                cache.battery_voltage_v = Some(d.voltage_battery as f32 / 100.0);
+            }
+            if d.current_battery >= 0 {
+                cache.battery_current_a = Some(d.current_battery as f32 / 100.0);
+            }
+            if d.battery_remaining >= 0 {
+                cache.battery_remaining_pct = Some(d.battery_remaining);
+            }
         }
         MavMessage::HOME_POSITION(d) => {
             cache.home_lat_deg = Some(d.latitude as f64 / 1e7);
@@ -365,31 +382,24 @@ where
                             *index += 1;
                             if *index >= waypoints.len() {
                                 if *resume_after {
-                                    let (snapshot_items, resume_seq) = {
+                                    let resume_seq = {
                                         let store = match recv_store.lock() {
                                             Ok(s) => s,
                                             Err(_) => continue,
                                         };
                                         match store.get_snapshot() {
-                                            Some((items, seq)) => (items.to_vec(), seq),
+                                            Some((_, seq)) => seq,
                                             None => continue,
                                         }
                                     };
                                     drop(state_guard);
-                                    {
-                                        let mut store = recv_store.lock().unwrap();
-                                        store.set_upload_pending(snapshot_items.clone());
-                                    }
-                                    let count = snapshot_items.len() as u16;
-                                    let _ = recv_conn.send_default(&MavMessage::MISSION_COUNT(
-                                        mavlink::ardupilotmega::MISSION_COUNT_DATA {
-                                            count,
-                                            target_system: vehicle_ids.system_id,
-                                            target_component: vehicle_ids.component_id,
-                                        },
-                                    ));
+                                    let _ = resume_mission_execution(
+                                        recv_conn.as_ref(),
+                                        vehicle_ids,
+                                        resume_seq,
+                                    );
                                     if let Ok(mut st) = recv_override.lock() {
-                                        *st = HttpOverrideState::Resuming { resume_seq };
+                                        *st = HttpOverrideState::MissionRunning;
                                     }
                                 } else {
                                     drop(state_guard);

@@ -123,6 +123,14 @@ struct TelemetryResponse {
     home_lon_deg: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     home_alt_m: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    battery_voltage_v: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    battery_current_a: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    battery_power_w: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    battery_remaining_pct: Option<i8>,
 }
 
 #[derive(Serialize)]
@@ -237,8 +245,16 @@ async fn get_telemetry(State(state): State<Arc<AppState>>) -> Json<TelemetryResp
                 home_lat_deg: None,
                 home_lon_deg: None,
                 home_alt_m: None,
+                battery_voltage_v: None,
+                battery_current_a: None,
+                battery_power_w: None,
+                battery_remaining_pct: None,
             });
         }
+    };
+    let battery_power_w = match (t.battery_voltage_v, t.battery_current_a) {
+        (Some(v), Some(a)) if v.is_finite() && a.is_finite() => Some(v * a),
+        _ => None,
     };
     Json(TelemetryResponse {
         ok: t.lat.is_some() && t.lon.is_some(),
@@ -262,6 +278,10 @@ async fn get_telemetry(State(state): State<Arc<AppState>>) -> Json<TelemetryResp
         home_lat_deg: t.home_lat_deg,
         home_lon_deg: t.home_lon_deg,
         home_alt_m: t.home_alt_m,
+        battery_voltage_v: t.battery_voltage_v,
+        battery_current_a: t.battery_current_a,
+        battery_power_w,
+        battery_remaining_pct: t.battery_remaining_pct,
     })
 }
 
@@ -545,12 +565,6 @@ async fn post_apply_tool(
                 None,
             ),
             "start_mission" => {
-                mission_upload::ensure_nav_takeoff_on_fc(
-                    conn.as_ref(),
-                    ids,
-                    &st.mission,
-                    Some(&st.override_state),
-                )?;
                 let telem_guard = st.telem.lock().map_err(|e| format!("telem_lock:{e}"))?;
                 mission_upload::start_auto_mission(
                     conn.as_ref(),

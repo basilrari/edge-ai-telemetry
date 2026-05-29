@@ -8,7 +8,7 @@
 //! - **`goto_location`**: `{"lat_deg":..,"lon_deg":..,"alt_m":..}` — `alt_m` is **relative to home**
 //!   (same convention as TUI interrupt / `COMMAND_INT` DO_REPOSITION). Omitted or `<= 0` → **15 m**. **No** automatic takeoff; the LLM should emit **`arm`**, **`takeoff`**, then **`goto_location`** when starting from the ground.
 //! - **`mission_interrupt`**: pause AUTO mission and hold (TUI `i`); needs GPS + home + recv thread.
-//! - **`mission_resume`**: upload snapshot and resume (TUI `c`); recv completes on `MISSION_ACK`.
+//! - **`mission_resume`**: continue the **existing FC mission** after interrupt (AUTO + MISSION_START); **no upload**.
 //! - **`waypoint_inject`**: guided goto; `{"lat_deg","lon_deg","alt_m"}` or `{"waypoint_text":"…"}` (TUI `w`). **No** automatic takeoff.
 //! - **`move_forward`**: optional `{"speed_m_s": 3}` forward body-frame velocity.
 

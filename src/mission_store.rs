@@ -145,7 +145,7 @@ impl MissionStore {
         if !self.has_nav_takeoff() {
             return Err(format!(
                 "start_mission: loaded mission has {} item(s) but no NAV_TAKEOFF (ArduCopter AUTO needs a TAKEOFF mission item first). \
-                 A separate takeoff command does not count — re-upload from Mission planner or use start_mission again to auto-insert TAKEOFF.",
+                 Upload a mission with takeoff from the Mission Planner — prompts cannot modify waypoints on the FC.",
                 self.items.len()
             ));
         }
