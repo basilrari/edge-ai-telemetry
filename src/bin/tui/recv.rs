@@ -10,7 +10,7 @@ use drone_server::{
     mavlink_streams::{heartbeat_from_autopilot, refresh_mavlink_streams},
     mission_set_current, mission_start, set_mode_auto, MissionStore, VehicleIds,
 };
-use mavlink::ardupilotmega::MavMessage;
+use mavlink::ardupilotmega::{MavMessage, MavMissionResult};
 use mavlink::{MavConnection, MavFrame};
 
 use crate::consts::{
@@ -164,11 +164,11 @@ where
                         item.target_system = frame.header.system_id;
                         item.target_component = frame.header.component_id;
                         let _ = conn_lock.send_default(&MavMessage::MISSION_ITEM_INT(item));
-                        store.note_upload_item_sent();
+                        store.note_upload_item_sent(seq);
                     }
                 }
             }
-            if let MavMessage::MISSION_ACK(_) = &frame.msg {
+            if let MavMessage::MISSION_ACK(ack) = &frame.msg {
                 let resume_seq = if let Ok(state) = recv_override.lock() {
                     if let OverrideState::Resuming { resume_seq } = *state {
                         Some(resume_seq)
@@ -191,17 +191,22 @@ where
                     if let Ok(mut state) = recv_override.lock() {
                         *state = OverrideState::MissionRunning;
                     }
-                } else if recv_store
-                    .lock()
-                    .map(|s| s.upload_pending.is_some() && s.upload_ready_for_ack())
-                    .unwrap_or(false)
-                {
-                    if let Ok(mut store) = recv_store.lock() {
-                        if let Some(items) = store.upload_pending.clone() {
-                            store.items = items;
-                            store.current_seq = Some(0);
+                } else if let Ok(mut store) = recv_store.lock() {
+                    if store.awaiting_clear_ack {
+                        store.awaiting_clear_ack = false;
+                    } else if store.upload_pending.is_some() {
+                        if ack.mavtype != MavMissionResult::MAV_MISSION_ACCEPTED {
+                            store.mark_upload_failed(format!(
+                                "mission upload: FC rejected (MAV_MISSION_RESULT={:?})",
+                                ack.mavtype
+                            ));
+                        } else if store.upload_ready_for_ack() {
+                            if let Some(items) = store.upload_pending.clone() {
+                                store.items = items;
+                                store.current_seq = Some(0);
+                            }
+                            store.set_upload_done();
                         }
-                        store.set_upload_done();
                     }
                 }
             }

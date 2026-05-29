@@ -1,5 +1,7 @@
 //! Mission store: holds the current mission from the FC and a snapshot for override/resume.
 
+use std::collections::HashSet;
+
 #[allow(deprecated)]
 use mavlink::ardupilotmega::{MavCmd, MISSION_ITEM_INT_DATA};
 
@@ -22,6 +24,11 @@ pub struct MissionStore {
     pub awaiting_clear_ack: bool,
     /// How many mission items we have sent to the FC during the current upload handshake.
     pub upload_items_sent: u16,
+    /// Unique mission seq numbers successfully sent during the current upload.
+    pub upload_sent_seqs: HashSet<u16>,
+    /// Set when the FC rejects or cancels an in-progress upload.
+    pub upload_failed: bool,
+    pub upload_fail_reason: Option<String>,
 }
 
 impl Default for MissionStore {
@@ -34,6 +41,9 @@ impl Default for MissionStore {
             upload_done: false,
             awaiting_clear_ack: false,
             upload_items_sent: 0,
+            upload_sent_seqs: HashSet::new(),
+            upload_failed: false,
+            upload_fail_reason: None,
         }
     }
 }
@@ -118,19 +128,39 @@ impl MissionStore {
     /// Start upload: set pending items. Caller must then send MISSION_COUNT(count).
     pub fn set_upload_pending(&mut self, items: Vec<StoredMissionItem>) {
         self.upload_done = false;
+        self.upload_failed = false;
+        self.upload_fail_reason = None;
         self.upload_items_sent = 0;
+        self.upload_sent_seqs.clear();
         self.upload_pending = Some(items);
     }
 
-    pub fn note_upload_item_sent(&mut self) {
+    pub fn note_upload_item_sent(&mut self, seq: u16) {
         self.upload_items_sent = self.upload_items_sent.saturating_add(1);
+        self.upload_sent_seqs.insert(seq);
     }
 
-    pub fn upload_ready_for_ack(&self) -> bool {
+    /// True once every pending item seq has been sent at least once (ArduPilot pull protocol).
+    pub fn all_upload_items_sent(&self) -> bool {
         let Some(items) = &self.upload_pending else {
             return false;
         };
-        !items.is_empty() && self.upload_items_sent >= items.len() as u16
+        !items.is_empty()
+            && items
+                .iter()
+                .all(|it| self.upload_sent_seqs.contains(&it.seq))
+    }
+
+    pub fn upload_ready_for_ack(&self) -> bool {
+        self.all_upload_items_sent()
+    }
+
+    pub fn mark_upload_failed(&mut self, reason: impl Into<String>) {
+        self.upload_failed = true;
+        self.upload_fail_reason = Some(reason.into());
+        self.upload_pending = None;
+        self.upload_sent_seqs.clear();
+        self.upload_items_sent = 0;
     }
 
     /// Get the item to send for seq (for MISSION_REQUEST(_INT) response).
@@ -147,8 +177,11 @@ impl MissionStore {
     pub fn set_upload_done(&mut self) {
         self.upload_pending = None;
         self.upload_done = true;
+        self.upload_failed = false;
+        self.upload_fail_reason = None;
         self.awaiting_clear_ack = false;
         self.upload_items_sent = 0;
+        self.upload_sent_seqs.clear();
     }
 
     /// Drop all cached mission state (after FC clear or local reset).
@@ -160,6 +193,9 @@ impl MissionStore {
         self.upload_done = false;
         self.awaiting_clear_ack = false;
         self.upload_items_sent = 0;
+        self.upload_sent_seqs.clear();
+        self.upload_failed = false;
+        self.upload_fail_reason = None;
     }
 
     /// Whether we have a snapshot (override was started and not yet resumed).
@@ -250,5 +286,20 @@ mod tests {
             15.0,
         ));
         assert_eq!(store.items[0].command, MavCmd::MAV_CMD_NAV_TAKEOFF);
+    }
+
+    #[test]
+    fn upload_ready_requires_unique_seqs_not_retry_count() {
+        let mut store = MissionStore::new();
+        store.set_upload_pending(vec![
+            wp_item(0, MavCmd::MAV_CMD_NAV_TAKEOFF, 0, 0, 15.0),
+            wp_item(1, MavCmd::MAV_CMD_NAV_WAYPOINT, 1, 1, 15.0),
+        ]);
+        for _ in 0..6 {
+            store.note_upload_item_sent(0);
+        }
+        assert!(!store.upload_ready_for_ack());
+        store.note_upload_item_sent(1);
+        assert!(store.upload_ready_for_ack());
     }
 }

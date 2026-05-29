@@ -12,7 +12,7 @@ use crate::{
     goto_global_command_int, mission_set_current, mission_start, resume_mission_execution,
     set_mode_auto, MissionStore, VehicleIds,
 };
-use mavlink::ardupilotmega::{MavMessage, MavModeFlag};
+use mavlink::ardupilotmega::{MavMessage, MavModeFlag, MavMissionResult};
 use mavlink::{MavConnection, MavFrame};
 
 /// Horizontal distance (m) to consider a waypoint reached (same as TUI).
@@ -333,8 +333,20 @@ where
                     if let Some(mut item) = store.take_upload_item(seq) {
                         item.target_system = frame.header.system_id;
                         item.target_component = frame.header.component_id;
-                        let _ = recv_conn.send_default(&MavMessage::MISSION_ITEM_INT(item));
-                        store.note_upload_item_sent();
+                        if recv_conn
+                            .send_default(&MavMessage::MISSION_ITEM_INT(item))
+                            .is_ok()
+                        {
+                            store.note_upload_item_sent(seq);
+                            flight_log.push_flight(
+                                "info",
+                                format!(
+                                    "mission upload: sent item {seq} ({}/{})",
+                                    store.upload_sent_seqs.len(),
+                                    store.upload_pending.as_ref().map(|v| v.len()).unwrap_or(0)
+                                ),
+                            );
+                        }
                     } else if store.upload_pending.is_some() {
                         flight_log.push_flight(
                             "warn",
@@ -346,7 +358,7 @@ where
                 }
             }
 
-            if let MavMessage::MISSION_ACK(_) = &frame.msg {
+            if let MavMessage::MISSION_ACK(ack) = &frame.msg {
                 let resume_seq = if let Ok(guard) = recv_override.lock() {
                     match &*guard {
                         HttpOverrideState::Resuming { resume_seq } => Some(*resume_seq),
@@ -365,21 +377,41 @@ where
                     if let Ok(mut state) = recv_override.lock() {
                         *state = HttpOverrideState::MissionRunning;
                     }
-                } else {
-                    let is_upload = recv_override
-                        .lock()
-                        .map(|g| matches!(*g, HttpOverrideState::Uploading))
-                        .unwrap_or(false);
-                    if let Ok(mut store) = recv_store.lock() {
-                        if store.awaiting_clear_ack {
-                            store.awaiting_clear_ack = false;
-                        } else if store.upload_pending.is_some() && store.upload_ready_for_ack() {
+                } else if let Ok(mut store) = recv_store.lock() {
+                    if store.awaiting_clear_ack {
+                        store.awaiting_clear_ack = false;
+                    } else if store.upload_pending.is_some() {
+                        if ack.mavtype != MavMissionResult::MAV_MISSION_ACCEPTED {
+                            let reason = format!(
+                                "mission upload: FC rejected (MAV_MISSION_RESULT={:?})",
+                                ack.mavtype
+                            );
+                            flight_log.push_flight("error", reason.clone());
+                            store.mark_upload_failed(reason);
+                            if recv_override
+                                .lock()
+                                .map(|g| matches!(*g, HttpOverrideState::Uploading))
+                                .unwrap_or(false)
+                            {
+                                if let Ok(mut state) = recv_override.lock() {
+                                    *state = HttpOverrideState::MissionRunning;
+                                }
+                            }
+                        } else if store.upload_ready_for_ack() {
                             if let Some(items) = store.upload_pending.clone() {
                                 store.items = items;
                                 store.current_seq = Some(0);
                             }
                             store.set_upload_done();
-                            if is_upload {
+                            flight_log.push_flight(
+                                "info",
+                                "mission upload: FC accepted (MISSION_ACK)".to_string(),
+                            );
+                            if recv_override
+                                .lock()
+                                .map(|g| matches!(*g, HttpOverrideState::Uploading))
+                                .unwrap_or(false)
+                            {
                                 if let Ok(mut state) = recv_override.lock() {
                                     *state = HttpOverrideState::MissionRunning;
                                 }

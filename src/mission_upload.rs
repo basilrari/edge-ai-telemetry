@@ -270,10 +270,19 @@ pub fn upload_mission_items<C: MavConnection<MavMessage>>(
 
     for _ in 0..UPLOAD_POLL_ITERATIONS {
         std::thread::sleep(Duration::from_millis(UPLOAD_POLL_INTERVAL_MS));
-        let done = mission
-            .lock()
-            .map_err(|e| format!("mission_lock:{e}"))?
-            .upload_done;
+        let (done, failed, fail_reason) = {
+            let store = mission.lock().map_err(|e| format!("mission_lock:{e}"))?;
+            (
+                store.upload_done,
+                store.upload_failed,
+                store.upload_fail_reason.clone(),
+            )
+        };
+        if failed {
+            return Err(fail_reason.unwrap_or_else(|| {
+                "mission upload: rejected by flight controller".into()
+            }));
+        }
         if done {
             return Ok(items.len());
         }
@@ -285,6 +294,9 @@ pub fn upload_mission_items<C: MavConnection<MavMessage>>(
         store.upload_done = false;
         store.awaiting_clear_ack = false;
         store.upload_items_sent = 0;
+        store.upload_sent_seqs.clear();
+        store.upload_failed = false;
+        store.upload_fail_reason = None;
     }
     if let Some(os_arc) = http_override {
         if let Ok(mut os) = os_arc.lock() {
