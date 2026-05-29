@@ -138,8 +138,7 @@ impl MissionStore {
     pub fn validate_ready_for_start_mission(&self) -> Result<(), String> {
         if self.items.is_empty() {
             return Err(
-                "start_mission: no mission downloaded on this link yet (wait for MISSION_ITEM_INT after connect, or upload in QGC/Mission Planner). TUI shows: \"Mission start blocked: no mission downloaded yet\"."
-                    .to_string(),
+                "start_mission: no mission on the link — upload a mission with takeoff from the Mission page first, then try again.".to_string(),
             );
         }
         if !self.has_nav_takeoff() {

@@ -351,16 +351,33 @@ pub fn start_auto_mission<C: MavConnection<MavMessage>>(
     mission: &Arc<Mutex<MissionStore>>,
     telem: &TelemetryCache,
 ) -> Result<(), String> {
-    let items = {
-        let store = mission.lock().map_err(|e| format!("mission_lock:{e}"))?;
-        store.validate_ready_for_start_mission()?;
-        store.items.clone()
-    };
-
     let airborne = telem
         .relative_alt_m
         .map(|a| a > AIRBORNE_MIN_M)
         .unwrap_or(false);
+
+    let items = {
+        let store = mission.lock().map_err(|e| format!("mission_lock:{e}"))?;
+        if store.items.is_empty() {
+            return Err(
+                "start_mission: no mission on the link — upload a mission with takeoff from the Mission page first."
+                    .into(),
+            );
+        }
+        let mut items = store.items.clone();
+        if !MissionStore::items_have_nav_takeoff(&items) && !airborne {
+            let alt = infer_takeoff_alt_m(&items);
+            items = prepend_nav_takeoff(items, ids, alt);
+        }
+        items
+    };
+
+    // On the ground, push the mission to the FC before AUTO so ArduPilot does not
+    // PreArm-fail with "Mode requires mission" when the link cache and FC are out of sync.
+    if !airborne {
+        upload_mission_items(conn, ids, mission, None, items.clone())?;
+    }
+
     if airborne {
         if let Some(seq) = items
             .iter()
