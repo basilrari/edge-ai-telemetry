@@ -42,6 +42,15 @@ impl Default for HttpOverrideState {
 /// Default target height above home when altitude is omitted, zero, or non-positive.
 pub const DEFAULT_ALTITUDE_ABOVE_HOME_M: f32 = 15.0;
 
+/// MAVLink `SYS_STATUS.voltage_battery` is millivolts; `UINT16_MAX` means unknown.
+pub fn sys_status_voltage_v(raw: u16) -> Option<f32> {
+    if raw == u16::MAX {
+        None
+    } else {
+        Some(raw as f32 / 1000.0)
+    }
+}
+
 /// Meters above home: finite values `> 0` are used as-is; otherwise `DEFAULT_ALTITUDE_ABOVE_HOME_M`.
 pub fn altitude_above_home_m(value: Option<f64>) -> f32 {
     match value {
@@ -103,6 +112,12 @@ mod altitude_tests {
             resolve_takeoff_altitude_m(&params, &telem).unwrap(),
             DEFAULT_ALTITUDE_ABOVE_HOME_M
         );
+    }
+
+    #[test]
+    fn sys_status_voltage_millivolts_to_volts() {
+        assert_eq!(sys_status_voltage_v(12_600), Some(12.6));
+        assert_eq!(sys_status_voltage_v(u16::MAX), None);
     }
 }
 
@@ -196,9 +211,7 @@ fn telem_update_from_frame(cache: &mut TelemetryCache, frame: &MavFrame<MavMessa
             cache.climb_m_s = Some(d.climb);
         }
         MavMessage::SYS_STATUS(d) => {
-            if d.voltage_battery != u16::MAX {
-                cache.battery_voltage_v = Some(d.voltage_battery as f32 / 100.0);
-            }
+            cache.battery_voltage_v = sys_status_voltage_v(d.voltage_battery);
             if d.current_battery >= 0 {
                 cache.battery_current_a = Some(d.current_battery as f32 / 100.0);
             }
@@ -321,6 +334,7 @@ where
                         item.target_system = frame.header.system_id;
                         item.target_component = frame.header.component_id;
                         let _ = recv_conn.send_default(&MavMessage::MISSION_ITEM_INT(item));
+                        store.note_upload_item_sent();
                     } else if store.upload_pending.is_some() {
                         flight_log.push_flight(
                             "warn",
@@ -356,21 +370,19 @@ where
                         .lock()
                         .map(|g| matches!(*g, HttpOverrideState::Uploading))
                         .unwrap_or(false);
-                    let has_pending = recv_store
-                        .lock()
-                        .map(|s| s.upload_pending.is_some())
-                        .unwrap_or(false);
-                    if is_upload || has_pending {
-                        if let Ok(mut store) = recv_store.lock() {
+                    if let Ok(mut store) = recv_store.lock() {
+                        if store.awaiting_clear_ack {
+                            store.awaiting_clear_ack = false;
+                        } else if store.upload_pending.is_some() && store.upload_ready_for_ack() {
                             if let Some(items) = store.upload_pending.clone() {
                                 store.items = items;
                                 store.current_seq = Some(0);
                             }
                             store.set_upload_done();
-                        }
-                        if is_upload {
-                            if let Ok(mut state) = recv_override.lock() {
-                                *state = HttpOverrideState::MissionRunning;
+                            if is_upload {
+                                if let Ok(mut state) = recv_override.lock() {
+                                    *state = HttpOverrideState::MissionRunning;
+                                }
                             }
                         }
                     }

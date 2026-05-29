@@ -18,6 +18,10 @@ pub struct MissionStore {
     pub upload_pending: Option<Vec<StoredMissionItem>>,
     /// Set to true when MISSION_ACK received during upload (so caller knows upload finished).
     pub upload_done: bool,
+    /// Ignore the next MISSION_ACK (e.g. after MISSION_CLEAR_ALL before a planner upload).
+    pub awaiting_clear_ack: bool,
+    /// How many mission items we have sent to the FC during the current upload handshake.
+    pub upload_items_sent: u16,
 }
 
 impl Default for MissionStore {
@@ -28,6 +32,8 @@ impl Default for MissionStore {
             snapshot: None,
             upload_pending: None,
             upload_done: false,
+            awaiting_clear_ack: false,
+            upload_items_sent: 0,
         }
     }
 }
@@ -39,12 +45,36 @@ impl MissionStore {
 
     /// Update store from a received MISSION_ITEM_INT (from FC).
     pub fn update_from_item(&mut self, d: &MISSION_ITEM_INT_DATA) {
-        let seq = d.seq;
+        let mut item = d.clone();
+        Self::normalize_item_command(&mut item);
+        if let Some(existing) = self.items.iter().find(|w| w.seq == item.seq) {
+            if existing.command == MavCmd::MAV_CMD_NAV_TAKEOFF
+                && item.command == MavCmd::MAV_CMD_NAV_WAYPOINT
+            {
+                item.command = MavCmd::MAV_CMD_NAV_TAKEOFF;
+            }
+        }
+        let seq = item.seq;
         if let Some(pos) = self.items.iter().position(|w| w.seq == seq) {
-            self.items[pos] = d.clone();
+            self.items[pos] = item;
         } else {
-            self.items.push(d.clone());
+            self.items.push(item);
             self.items.sort_by_key(|w| w.seq);
+        }
+    }
+
+    /// ArduPilot may report the takeoff slot as NAV_WAYPOINT at 0,0 — keep it as TAKEOFF for UI/tools.
+    fn normalize_item_command(item: &mut MISSION_ITEM_INT_DATA) {
+        if item.command == MavCmd::MAV_CMD_NAV_TAKEOFF {
+            return;
+        }
+        if item.seq == 0
+            && item.command == MavCmd::MAV_CMD_NAV_WAYPOINT
+            && item.z > 0.0
+            && item.x == 0
+            && item.y == 0
+        {
+            item.command = MavCmd::MAV_CMD_NAV_TAKEOFF;
         }
     }
 
@@ -88,7 +118,19 @@ impl MissionStore {
     /// Start upload: set pending items. Caller must then send MISSION_COUNT(count).
     pub fn set_upload_pending(&mut self, items: Vec<StoredMissionItem>) {
         self.upload_done = false;
+        self.upload_items_sent = 0;
         self.upload_pending = Some(items);
+    }
+
+    pub fn note_upload_item_sent(&mut self) {
+        self.upload_items_sent = self.upload_items_sent.saturating_add(1);
+    }
+
+    pub fn upload_ready_for_ack(&self) -> bool {
+        let Some(items) = &self.upload_pending else {
+            return false;
+        };
+        !items.is_empty() && self.upload_items_sent >= items.len() as u16
     }
 
     /// Get the item to send for seq (for MISSION_REQUEST(_INT) response).
@@ -105,6 +147,8 @@ impl MissionStore {
     pub fn set_upload_done(&mut self) {
         self.upload_pending = None;
         self.upload_done = true;
+        self.awaiting_clear_ack = false;
+        self.upload_items_sent = 0;
     }
 
     /// Drop all cached mission state (after FC clear or local reset).
@@ -114,6 +158,8 @@ impl MissionStore {
         self.snapshot = None;
         self.upload_pending = None;
         self.upload_done = false;
+        self.awaiting_clear_ack = false;
+        self.upload_items_sent = 0;
     }
 
     /// Whether we have a snapshot (override was started and not yet resumed).
@@ -152,5 +198,57 @@ impl MissionStore {
             ));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mavlink::ardupilotmega::MavFrame;
+
+    fn wp_item(seq: u16, command: MavCmd, x: i32, y: i32, z: f32) -> MISSION_ITEM_INT_DATA {
+        MISSION_ITEM_INT_DATA {
+            param1: 0.0,
+            param2: 0.0,
+            param3: 0.0,
+            param4: 0.0,
+            x,
+            y,
+            z,
+            seq,
+            command,
+            target_system: 1,
+            target_component: 1,
+            frame: MavFrame::MAV_FRAME_GLOBAL_RELATIVE_ALT,
+            current: 0,
+            autocontinue: 1,
+        }
+    }
+
+    #[test]
+    fn normalize_zero_zero_waypoint_as_takeoff() {
+        let mut item = wp_item(0, MavCmd::MAV_CMD_NAV_WAYPOINT, 0, 0, 15.0);
+        MissionStore::normalize_item_command(&mut item);
+        assert_eq!(item.command, MavCmd::MAV_CMD_NAV_TAKEOFF);
+    }
+
+    #[test]
+    fn preserve_takeoff_when_fc_rewrites_command() {
+        let mut store = MissionStore::new();
+        store.update_from_item(&wp_item(
+            0,
+            MavCmd::MAV_CMD_NAV_TAKEOFF,
+            0,
+            0,
+            15.0,
+        ));
+        store.update_from_item(&wp_item(
+            0,
+            MavCmd::MAV_CMD_NAV_WAYPOINT,
+            23_558_000,
+            120_473_000,
+            15.0,
+        ));
+        assert_eq!(store.items[0].command, MavCmd::MAV_CMD_NAV_TAKEOFF);
     }
 }

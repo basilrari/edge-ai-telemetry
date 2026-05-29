@@ -242,13 +242,15 @@ fn main() {
                         println!("HOME lat={:.6} lon={:.6} alt={:.1}m", lat_deg, lon_deg, alt_m);
                     }
                     MavMessage::SYS_STATUS(d) => {
-                        let vbat_v = d.voltage_battery as f32 / 100.0;
+                        let vbat_v = crate::mavlink_http_runtime::sys_status_voltage_v(d.voltage_battery)
+                            .map(|v| format!("{v:.2}"))
+                            .unwrap_or_else(|| "?".into());
                         let batt_pct = if d.battery_remaining < 0 {
                             "?".to_string()
                         } else {
                             format!("{}%", d.battery_remaining)
                         };
-                        println!("SYS vbat={:.2}V batt={}", vbat_v, batt_pct);
+                        println!("SYS vbat={vbat_v}V batt={batt_pct}");
                     }
                     MavMessage::BATTERY_STATUS(d) => {
                         if d.voltages[0] != 0 && d.voltages[0] != U16_MAX {

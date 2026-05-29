@@ -164,6 +164,7 @@ where
                         item.target_system = frame.header.system_id;
                         item.target_component = frame.header.component_id;
                         let _ = conn_lock.send_default(&MavMessage::MISSION_ITEM_INT(item));
+                        store.note_upload_item_sent();
                     }
                 }
             }
@@ -192,7 +193,7 @@ where
                     }
                 } else if recv_store
                     .lock()
-                    .map(|s| s.upload_pending.is_some())
+                    .map(|s| s.upload_pending.is_some() && s.upload_ready_for_ack())
                     .unwrap_or(false)
                 {
                     if let Ok(mut store) = recv_store.lock() {

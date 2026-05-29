@@ -5,6 +5,7 @@
 use mavlink::ardupilotmega::{GpsFixType, MavMessage, MavModeFlag};
 use mavlink::MavFrame;
 
+use crate::mavlink_http_runtime::sys_status_voltage_v;
 use crate::mavlink_streams::heartbeat_from_autopilot;
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -97,11 +98,9 @@ pub fn format_mavlink_frame(frame: &MavFrame<MavMessage>) -> Option<MavlinkLogEn
             ),
         ),
         MavMessage::SYS_STATUS(d) => {
-            let v = if d.voltage_battery != u16::MAX {
-                format!("{:.1}V", d.voltage_battery as f32 / 100.0)
-            } else {
-                "—".into()
-            };
+            let v = sys_status_voltage_v(d.voltage_battery)
+                .map(|v| format!("{:.1}V", v))
+                .unwrap_or_else(|| "—".into());
             let a = if d.current_battery >= 0 {
                 format!("{:.1}A", d.current_battery as f32 / 100.0)
             } else {
