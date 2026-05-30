@@ -332,7 +332,7 @@ async fn post_mission_upload(
     let span = info_span!("drone_http_mission_upload", request_id = %rid);
     let _enter = span.enter();
 
-    state.logs.push_flight("info", "mission_upload: received planner mission");
+    state.logs.push_flight("info", "mission upload: received planner mission");
 
     let st = Arc::clone(&state);
     let result = tokio::task::spawn_blocking(move || {
@@ -356,7 +356,7 @@ async fn post_mission_upload(
         Ok(count) => {
             state.logs.push_flight(
                 "info",
-                format!("mission_upload: ok ({count} items on FC)"),
+                format!("mission upload: ok ({count} items on FC)"),
             );
             (
                 StatusCode::OK,
@@ -369,7 +369,7 @@ async fn post_mission_upload(
         }
         Err(e) => {
             warn!(request_id = %rid, error = %e, "mission_upload failed");
-            state.logs.push_flight("error", format!("mission_upload: {e}"));
+            state.logs.push_flight("error", format!("mission upload: {e}"));
             (
                 StatusCode::BAD_REQUEST,
                 Json(MissionUploadResponse {

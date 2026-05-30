@@ -125,25 +125,33 @@ where
 
             // Update mission store from FC
             if let MavMessage::MISSION_ITEM_INT(d) = &frame.msg {
-                if let Ok(mut store) = recv_store.lock() {
+                let transfer_busy = recv_store
+                    .lock()
+                    .map(|s| s.mission_transfer_busy())
+                    .unwrap_or(false);
+                if transfer_busy {
+                    mission_count = None;
+                } else if let Ok(mut store) = recv_store.lock() {
                     store.update_from_item(d);
                 }
-                if let Some(count) = mission_count {
-                    let next_seq = d.seq + 1;
-                    if next_seq < count {
-                        let sys = frame.header.system_id;
-                        let comp = frame.header.component_id;
-                        let req = mavlink::ardupilotmega::MISSION_REQUEST_INT_DATA {
-                            target_system: sys,
-                            target_component: comp,
-                            seq: next_seq,
-                        };
-                        let _ = recv_conn
-                            .lock()
-                            .unwrap()
-                            .send_default(&MavMessage::MISSION_REQUEST_INT(req));
-                    } else {
-                        mission_count = None;
+                if !transfer_busy {
+                    if let Some(count) = mission_count {
+                        let next_seq = d.seq + 1;
+                        if next_seq < count {
+                            let sys = frame.header.system_id;
+                            let comp = frame.header.component_id;
+                            let req = mavlink::ardupilotmega::MISSION_REQUEST_INT_DATA {
+                                target_system: sys,
+                                target_component: comp,
+                                seq: next_seq,
+                            };
+                            let _ = recv_conn
+                                .lock()
+                                .unwrap()
+                                .send_default(&MavMessage::MISSION_REQUEST_INT(req));
+                        } else {
+                            mission_count = None;
+                        }
                     }
                 }
             }
@@ -294,7 +302,7 @@ where
                 if mission_count.is_none()
                     && recv_store
                         .lock()
-                        .map(|s| s.upload_pending.is_none())
+                        .map(|s| !s.mission_transfer_busy())
                         .unwrap_or(true)
                 {
                     mission_count = Some(d.count);

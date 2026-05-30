@@ -155,6 +155,11 @@ impl MissionStore {
         self.all_upload_items_sent()
     }
 
+    /// True while a planner upload or pre-upload clear is in progress (pause mission download).
+    pub fn mission_transfer_busy(&self) -> bool {
+        self.upload_pending.is_some() || self.awaiting_clear_ack
+    }
+
     pub fn mark_upload_failed(&mut self, reason: impl Into<String>) {
         self.upload_failed = true;
         self.upload_fail_reason = Some(reason.into());

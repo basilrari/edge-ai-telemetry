@@ -273,16 +273,6 @@ pub fn upload_mission_items<C: MavConnection<MavMessage>>(
     }))
     .map_err(|e| e.to_string())?;
 
-    if let Some(mut first) = items.first().cloned() {
-        first.target_system = ids.system_id;
-        first.target_component = ids.component_id;
-        if send_gcs(conn, &MavMessage::MISSION_ITEM_INT(first)).is_ok() {
-            if let Ok(mut store) = mission.lock() {
-                store.note_upload_item_sent(0);
-            }
-        }
-    }
-
     for _ in 0..UPLOAD_POLL_ITERATIONS {
         std::thread::sleep(Duration::from_millis(UPLOAD_POLL_INTERVAL_MS));
         let (done, failed, fail_reason) = {
