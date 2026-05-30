@@ -206,7 +206,7 @@ pub fn build_mission_items(
     Ok(items)
 }
 
-/// Upload pre-built mission items to the FC (shared by planner upload and start_mission fixup).
+/// Upload pre-built mission items to the FC (Mission Planner upload only).
 pub fn upload_mission_items<C: MavConnection<MavMessage>>(
     conn: &C,
     ids: VehicleIds,
@@ -402,7 +402,7 @@ pub fn mission_clear<C: MavConnection<MavMessage>>(
 
 const AIRBORNE_MIN_M: f64 = 2.5;
 
-/// AUTO + MISSION_START; when already airborne, skip NAV_TAKEOFF by setting current WP first.
+/// AUTO + MISSION_START using the mission already on the FC (upload only via Mission Planner).
 pub fn start_auto_mission<C: MavConnection<MavMessage>>(
     conn: &C,
     ids: VehicleIds,
@@ -414,34 +414,21 @@ pub fn start_auto_mission<C: MavConnection<MavMessage>>(
         .map(|a| a > AIRBORNE_MIN_M)
         .unwrap_or(false);
 
-    let items = {
+    {
         let store = mission.lock().map_err(|e| format!("mission_lock:{e}"))?;
-        if store.items.is_empty() {
-            return Err(
-                "start_mission: no mission on the link — upload a mission with takeoff from the Mission page first."
-                    .into(),
-            );
-        }
-        let mut items = store.items.clone();
-        if !MissionStore::items_have_nav_takeoff(&items) && !airborne {
-            let alt = infer_takeoff_alt_m(&items);
-            items = prepend_nav_takeoff(items, ids, alt);
-        }
-        items
-    };
-
-    // On the ground, push the mission to the FC before AUTO so ArduPilot does not
-    // PreArm-fail with "Mode requires mission" when the link cache and FC are out of sync.
-    if !airborne {
-        upload_mission_items(conn, ids, mission, None, items.clone())?;
+        store.validate_ready_for_start_mission()?;
     }
 
     if airborne {
-        if let Some(seq) = items
-            .iter()
-            .find(|it| it.command == MavCmd::MAV_CMD_NAV_WAYPOINT)
-            .map(|it| it.seq)
-        {
+        let seq = {
+            let store = mission.lock().map_err(|e| format!("mission_lock:{e}"))?;
+            store
+                .items
+                .iter()
+                .find(|it| it.command == MavCmd::MAV_CMD_NAV_WAYPOINT)
+                .map(|it| it.seq)
+        };
+        if let Some(seq) = seq {
             mission_set_current(conn, ids, seq).map_err(|e| e.to_string())?;
         }
     }
