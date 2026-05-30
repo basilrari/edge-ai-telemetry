@@ -92,6 +92,30 @@ impl LogsHub {
             .unwrap_or_default()
     }
 
+    pub fn clear_flight(&self) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.flight.clear();
+        }
+        let _ = self.tx.send(self.snapshot_ws());
+    }
+
+    pub fn clear_mavlink(&self) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.mavlink.clear();
+            inner.last_mavlink_emit.clear();
+        }
+        let _ = self.tx.send(self.snapshot_ws());
+    }
+
+    pub fn clear_all(&self) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.flight.clear();
+            inner.mavlink.clear();
+            inner.last_mavlink_emit.clear();
+        }
+        let _ = self.tx.send(self.snapshot_ws());
+    }
+
     pub fn push_flight(&self, level: &str, message: impl Into<String>) {
         let ts_ms = now_ms();
         let entry = FlightLogEntry {

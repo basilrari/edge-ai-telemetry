@@ -458,6 +458,52 @@ async fn get_mavlink_logs(State(state): State<Arc<AppState>>) -> Json<MavlinkLog
     })
 }
 
+#[derive(Deserialize)]
+struct ClearLogsBody {
+    #[serde(default = "default_clear_target")]
+    target: String,
+}
+
+fn default_clear_target() -> String {
+    "all".to_string()
+}
+
+#[derive(Serialize)]
+struct ClearLogsResponse {
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+async fn post_clear_logs(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<ClearLogsBody>,
+) -> (StatusCode, Json<ClearLogsResponse>) {
+    match body.target.as_str() {
+        "flight" => state.logs.clear_flight(),
+        "mavlink" => state.logs.clear_mavlink(),
+        "all" => state.logs.clear_all(),
+        other => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ClearLogsResponse {
+                    ok: false,
+                    error: Some(format!(
+                        "unknown logs target {other:?}; use flight, mavlink, or all"
+                    )),
+                }),
+            );
+        }
+    }
+    (
+        StatusCode::OK,
+        Json(ClearLogsResponse {
+            ok: true,
+            error: None,
+        }),
+    )
+}
+
 async fn ws_logs(
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
@@ -761,6 +807,7 @@ async fn main() {
         .route("/v1/mission/upload", post(post_mission_upload))
         .route("/v1/mission/clear", post(post_mission_clear))
         .route("/v1/logs", get(get_logs))
+        .route("/v1/logs/clear", post(post_clear_logs))
         .route("/v1/logs/mavlink", get(get_mavlink_logs))
         .route("/v1/apply-tool", post(post_apply_tool))
         .route("/v1/ws/telemetry", get(ws_telemetry))
