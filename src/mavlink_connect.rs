@@ -112,8 +112,10 @@ pub fn usage_string() -> &'static str {
     "\
   --serial [DEVICE]   USB serial to FC (default device /dev/ttyACM0)
   --baud <RATE>       With --serial only (default 115200)
+  --udp | --proxy     UDP listen only (MAVProxy / mavlink-router on 14550)
 
-  Default: UDP listen udpin:0.0.0.0:14550
+  Default (no args): auto-detect UDP then USB serial
+  Explicit UDP: udpin:0.0.0.0:14550
 
 If GPS/battery/HUD stay at zero, you are probably not on the FC link: use
 --serial when the Pixhawk is on USB (e.g. Jetson /dev/ttyACM0), or forward
@@ -132,13 +134,29 @@ pub fn resolve_from_args(
 ) -> Result<(String, String), MavlinkArgsError> {
     let mut args = args.into_iter().peekable();
     let mut use_serial = false;
+    let mut use_udp = false;
     let mut serial_device: Option<String> = None;
     let mut baud: Option<u32> = None;
 
     while let Some(a) = args.next() {
         match a.as_str() {
             "-h" | "--help" => return Err(MavlinkArgsError::Help),
+            "--udp" | "--proxy" => {
+                if use_serial {
+                    return Err(MavlinkArgsError::Invalid(
+                        "--udp/--proxy cannot be combined with --serial\n\n".to_string()
+                            + usage_string(),
+                    ));
+                }
+                use_udp = true;
+            }
             "--serial" => {
+                if use_udp {
+                    return Err(MavlinkArgsError::Invalid(
+                        "--serial cannot be combined with --udp/--proxy\n\n".to_string()
+                            + usage_string(),
+                    ));
+                }
                 use_serial = true;
                 if let Some(next) = args.peek() {
                     if !next.starts_with('-') {
@@ -167,6 +185,13 @@ pub fn resolve_from_args(
     if baud.is_some() && !use_serial {
         return Err(MavlinkArgsError::Invalid(
             "--baud is only valid with --serial\n\n".to_string() + usage_string(),
+        ));
+    }
+
+    if use_udp {
+        return Ok((
+            DEFAULT_UDP_URL.to_string(),
+            default_udp_display().to_string(),
         ));
     }
 
@@ -226,31 +251,31 @@ fn udp_bind_from_url(url: &str) -> Option<String> {
     url.strip_prefix("udpin:").map(str::to_string)
 }
 
-fn udpout_url(peer: SocketAddr) -> String {
-    format!("udpout:{}", peer)
-}
-
 fn parse_autopilot_heartbeat(buf: &[u8]) -> Option<(u8, u8)> {
-    let start = buf
-        .iter()
-        .position(|b| *b == MAV_STX || *b == MAV_STX_V2)?;
-    let mut cur = PeekReader::new(Cursor::new(&buf[start..]));
-    let (header, msg) = read_any_msg::<MavMessage, _>(&mut cur).ok()?;
-    let frame = MavFrame {
-        header,
-        msg,
-        protocol_version: mavlink::MavlinkVersion::V2,
-    };
-    if let MavMessage::HEARTBEAT(d) = &frame.msg {
-        if heartbeat_from_autopilot(&frame, d.mavtype) {
-            return Some((frame.header.system_id, frame.header.component_id));
+    for i in 0..buf.len() {
+        if buf[i] != MAV_STX && buf[i] != MAV_STX_V2 {
+            continue;
+        }
+        let mut cur = PeekReader::new(Cursor::new(&buf[i..]));
+        let (header, msg) = match read_any_msg::<MavMessage, _>(&mut cur) {
+            Ok(pair) => pair,
+            Err(_) => continue,
+        };
+        let frame = MavFrame {
+            header,
+            msg,
+            protocol_version: mavlink::MavlinkVersion::V2,
+        };
+        if let MavMessage::HEARTBEAT(d) = &frame.msg {
+            if heartbeat_from_autopilot(&frame, d.mavtype) {
+                return Some((frame.header.system_id, frame.header.component_id));
+            }
         }
     }
     None
 }
 
-/// On `udpin`, learn the autopilot peer address then reconnect as `udpout` so sends are not
-/// redirected to the last UDP packet source (e.g. MAVProxy heartbeats stealing the FC route).
+/// On `udpin`, learn the autopilot peer address (for link display / vehicle ids).
 pub fn discover_autopilot_udp_peer(
     bind: &str,
     timeout: Duration,
@@ -287,13 +312,12 @@ fn open_udp_pinned_to_autopilot(
     timeout: Duration,
 ) -> Result<(Connection<MavMessage>, LinkInfo, VehicleIds), ()> {
     let (peer, ids) = discover_autopilot_udp_peer(bind, timeout).map_err(|_| ())?;
-    let url = udpout_url(peer);
+    // Stay on `udpin`: remote MAVProxy / mavlink-router streams *to* our listen port.
+    // Switching to `udpout:peer` moves receive to an ephemeral port, so `recv_frame`
+    // blocks forever while the forwarder keeps sending to :14550.
+    let url = format!("udpin:{bind}");
     let mut conn = connect::<MavMessage>(&url).map_err(|_| ())?;
     tune_connection(&mut conn);
-    let verified = wait_autopilot_heartbeat(&conn, Duration::from_secs(2)).ok();
-    if verified.is_none() {
-        return Err(());
-    }
     Ok((
         conn,
         LinkInfo {
@@ -314,6 +338,8 @@ fn try_open_url(
         if let Ok((conn, link, _ids)) = open_udp_pinned_to_autopilot(&bind, timeout) {
             return Ok((conn, link));
         }
+        // Do not fall back to blocking `udpin` recv: with no traffic, recv_frame hangs forever.
+        return Err(());
     }
     let mut conn = connect::<MavMessage>(url).map_err(|_| ())?;
     tune_connection(&mut conn);
@@ -400,6 +426,15 @@ mod tests {
     fn serial_default_device() {
         let (u, _) = resolve_from_args(["--serial".to_string()].into_iter()).unwrap();
         assert_eq!(u, serial_url(DEFAULT_SERIAL_DEVICE, DEFAULT_SERIAL_BAUD));
+    }
+
+    #[test]
+    fn udp_proxy_flag() {
+        let (u, d) = resolve_from_args(["--udp".to_string()].into_iter()).unwrap();
+        assert_eq!(u, DEFAULT_UDP_URL);
+        assert_eq!(d, "MAVProxy");
+        let (u2, _) = resolve_from_args(["--proxy".to_string()].into_iter()).unwrap();
+        assert_eq!(u2, DEFAULT_UDP_URL);
     }
 
     #[test]

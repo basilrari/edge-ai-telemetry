@@ -263,19 +263,16 @@ where
                 timeout
             ));
         }
-        match conn.recv_frame() {
-            Ok(frame) => {
-                if let MavMessage::HEARTBEAT(d) = &frame.msg {
-                    if d.mavtype != MavType::MAV_TYPE_GCS && frame.header.component_id == 1 {
-                        return Ok(VehicleIds::new(
-                            frame.header.system_id,
-                            frame.header.component_id,
-                        ));
+        match conn.try_recv() {
+            Ok((header, msg)) => {
+                if let MavMessage::HEARTBEAT(d) = &msg {
+                    if d.mavtype != MavType::MAV_TYPE_GCS && header.component_id == 1 {
+                        return Ok(VehicleIds::new(header.system_id, header.component_id));
                     }
                 }
             }
-            Err(e) => {
-                return Err(format!("MAVLink recv while waiting for heartbeat: {e}"));
+            Err(_) => {
+                std::thread::sleep(Duration::from_millis(50));
             }
         }
     }

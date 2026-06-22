@@ -11,6 +11,8 @@
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
@@ -46,15 +48,100 @@ struct Args {
 }
 
 struct AppState {
-    /// Shared MAVLink link; serial uses separate read/write locks inside the driver (no outer Mutex).
-    conn: Arc<Connection<MavMessage>>,
-    link: LinkInfo,
+    /// Populated when MAVLink connects; HTTP starts before the link is up.
+    conn: Arc<Mutex<Option<Arc<Connection<MavMessage>>>>>,
+    link: Arc<Mutex<LinkInfo>>,
     vehicle_ids: Arc<Mutex<VehicleIds>>,
     mission: Arc<Mutex<MissionStore>>,
     override_state: Arc<Mutex<HttpOverrideState>>,
     telem: Arc<Mutex<TelemetryCache>>,
     logs: LogsHub,
     telemetry_hub: TelemetryHub,
+}
+
+fn disconnected_link() -> LinkInfo {
+    LinkInfo {
+        kind: "disconnected".to_string(),
+        display: "Waiting for MAVLink".to_string(),
+        url: String::new(),
+    }
+}
+
+fn read_link(state: &AppState) -> LinkInfo {
+    state
+        .link
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or_else(|_| disconnected_link())
+}
+
+fn require_conn(state: &AppState) -> Result<Arc<Connection<MavMessage>>, String> {
+    state
+        .conn
+        .lock()
+        .map_err(|e| format!("conn_lock:{e}"))?
+        .clone()
+        .ok_or_else(|| "mavlink_not_connected".to_string())
+}
+
+fn spawn_mavlink_connector(
+    mavlink_args: Vec<String>,
+    conn_slot: Arc<Mutex<Option<Arc<Connection<MavMessage>>>>>,
+    link_slot: Arc<Mutex<LinkInfo>>,
+    vehicle_ids: Arc<Mutex<VehicleIds>>,
+    mission: Arc<Mutex<MissionStore>>,
+    override_state: Arc<Mutex<HttpOverrideState>>,
+    telem: Arc<Mutex<TelemetryCache>>,
+    logs: LogsHub,
+    telemetry_hub: TelemetryHub,
+    recv_join: Arc<Mutex<Option<JoinHandle<()>>>>,
+) {
+    thread::spawn(move || {
+        loop {
+            match mavlink_connect::open_connection(mavlink_args.clone()) {
+                Ok((connection, link)) => {
+                    info!(
+                        url = %link.url,
+                        kind = %link.kind,
+                        display = %link.display,
+                        "MAVLink connected"
+                    );
+                    logs.push_flight(
+                        "info",
+                        format!("Link: {} ({})", link.display, link.kind),
+                    );
+                    let conn = Arc::new(connection);
+                    if let Ok(mut slot) = conn_slot.lock() {
+                        *slot = Some(Arc::clone(&conn));
+                    }
+                    if let Ok(mut slot) = link_slot.lock() {
+                        *slot = link.clone();
+                    }
+                    let join = spawn_http_mavlink_recv_thread(
+                        Arc::clone(&conn),
+                        Arc::clone(&mission),
+                        Arc::clone(&override_state),
+                        Arc::clone(&telem),
+                        Arc::clone(&vehicle_ids),
+                        logs.clone(),
+                        telemetry_hub.clone(),
+                        link,
+                    );
+                    if let Ok(mut slot) = recv_join.lock() {
+                        *slot = Some(join);
+                    }
+                    return;
+                }
+                Err(e) => {
+                    warn!(error = %e, "MAVLink unavailable; retrying in 5s");
+                    if let Ok(mut slot) = link_slot.lock() {
+                        *slot = disconnected_link();
+                    }
+                    thread::sleep(Duration::from_secs(5));
+                }
+            }
+        }
+    });
 }
 
 fn default_empty_object() -> serde_json::Value {
@@ -218,7 +305,7 @@ async fn get_health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> 
         mavlink_target_system: ids.system_id,
         mavlink_target_component: ids.component_id,
         known_tools: LLM_DRONE_TOOL_NAMES,
-        link: state.link.clone(),
+        link: read_link(&state),
     })
 }
 
@@ -228,7 +315,7 @@ async fn get_telemetry(State(state): State<Arc<AppState>>) -> Json<TelemetryResp
         Err(_) => {
             return Json(TelemetryResponse {
                 ok: false,
-                link: state.link.clone(),
+                link: read_link(&state),
                 lat_deg: None,
                 lon_deg: None,
                 alt_amsl_m: None,
@@ -258,7 +345,7 @@ async fn get_telemetry(State(state): State<Arc<AppState>>) -> Json<TelemetryResp
     };
     Json(TelemetryResponse {
         ok: t.lat.is_some() && t.lon.is_some(),
-        link: state.link.clone(),
+        link: read_link(&state),
         lat_deg: t.lat,
         lon_deg: t.lon,
         alt_amsl_m: t.alt_amsl_m,
@@ -336,13 +423,14 @@ async fn post_mission_upload(
 
     let st = Arc::clone(&state);
     let result = tokio::task::spawn_blocking(move || {
+        let conn = require_conn(&st)?;
         let ids = st
             .vehicle_ids
             .lock()
             .map(|g| *g)
             .map_err(|e| format!("vehicle_ids_lock:{e}"))?;
         mission_upload::mission_upload(
-            st.conn.as_ref(),
+            conn.as_ref(),
             ids,
             &st.mission,
             &st.override_state,
@@ -401,13 +489,14 @@ async fn post_mission_clear(
 
     let st = Arc::clone(&state);
     let result = tokio::task::spawn_blocking(move || {
+        let conn = require_conn(&st)?;
         let ids = st
             .vehicle_ids
             .lock()
             .map(|g| *g)
             .map_err(|e| format!("vehicle_ids_lock:{e}"))?;
         mission_upload::mission_clear(
-            st.conn.as_ref(),
+            conn.as_ref(),
             ids,
             &st.mission,
             Some(&st.override_state),
@@ -563,7 +652,8 @@ async fn handle_telemetry_ws(mut socket: WebSocket, state: Arc<AppState>) {
     // Immediate snapshot so clients do not wait for next MAVLink frame.
     let initial = {
         let t = state.telem.lock().ok();
-        t.map(|g| state.telemetry_hub.snapshot_now(&state.link, &g))
+        let link = read_link(&state);
+        t.map(|g| state.telemetry_hub.snapshot_now(&link, &g))
     };
     if let Some(snap) = initial {
         if let Ok(text) = serde_json::to_string(&snap) {
@@ -632,12 +722,12 @@ async fn post_apply_tool(
     let tool_name_for_log = body.tool.clone();
 
     let result = tokio::task::spawn_blocking(move || {
+        let conn = require_conn(&st)?;
         let ids = st
             .vehicle_ids
             .lock()
             .map(|g| *g)
             .map_err(|e| format!("vehicle_ids_lock:{e}"))?;
-        let conn = Arc::clone(&st.conn);
         match tool_for_blocking.as_str() {
             "mission_interrupt" => http_mission_tools::mission_interrupt(
                 conn.as_ref(),
@@ -749,37 +839,32 @@ async fn main() {
     }
 
     let logs = LogsHub::new();
-    let (connection, link) = match mavlink_connect::open_connection(args.mavlink.clone()) {
-        Ok(v) => v,
-        Err(e) => {
-            error!(error = %e, "failed to open MAVLink");
-            std::process::exit(1);
-        }
-    };
-    info!(url = %link.url, kind = %link.kind, display = %link.display, "MAVLink connected");
-    logs.push_flight("info", format!("Link: {} ({})", link.display, link.kind));
-
-    let conn = Arc::new(connection);
+    let conn_slot: Arc<Mutex<Option<Arc<Connection<MavMessage>>>>> =
+        Arc::new(Mutex::new(None));
+    let link_slot = Arc::new(Mutex::new(disconnected_link()));
+    let recv_join: Arc<Mutex<Option<JoinHandle<()>>>> = Arc::new(Mutex::new(None));
     let vehicle_ids = Arc::new(Mutex::new(VehicleIds::new(1, 1)));
     let mission = Arc::new(Mutex::new(MissionStore::default()));
     let override_state = Arc::new(Mutex::new(HttpOverrideState::default()));
     let telem = Arc::new(Mutex::new(TelemetryCache::default()));
     let telemetry_hub = TelemetryHub::new();
 
-    let _recv_join = spawn_http_mavlink_recv_thread(
-        Arc::clone(&conn),
+    spawn_mavlink_connector(
+        args.mavlink.clone(),
+        Arc::clone(&conn_slot),
+        Arc::clone(&link_slot),
+        Arc::clone(&vehicle_ids),
         Arc::clone(&mission),
         Arc::clone(&override_state),
         Arc::clone(&telem),
-        Arc::clone(&vehicle_ids),
         logs.clone(),
         telemetry_hub.clone(),
-        link.clone(),
+        Arc::clone(&recv_join),
     );
 
     let state = Arc::new(AppState {
-        conn,
-        link: link.clone(),
+        conn: conn_slot,
+        link: link_slot,
         vehicle_ids: Arc::clone(&vehicle_ids),
         mission,
         override_state,
@@ -789,6 +874,7 @@ async fn main() {
     });
 
     let ids_display = vehicle_ids.lock().map(|g| *g).unwrap_or_default();
+    let link_display = read_link(&state);
 
     let cors = CorsLayer::new()
         .allow_origin(Any)
@@ -823,7 +909,7 @@ async fn main() {
     eprintln!(
         "drone-http {} | MAVLink: {} | vehicle sys={} comp={}",
         args.listen,
-        link.display,
+        link_display.display,
         ids_display.system_id,
         ids_display.component_id
     );
