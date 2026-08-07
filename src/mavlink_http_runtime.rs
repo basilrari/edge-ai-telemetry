@@ -3,6 +3,7 @@
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+use crate::command_completion::CommandCompletionHub;
 use crate::logs_hub::LogsHub;
 use crate::mavlink_connect::LinkInfo;
 use crate::telemetry_hub::TelemetryHub;
@@ -13,7 +14,7 @@ use crate::{
     goto_global_command_int, mission_set_current, mission_start, resume_mission_execution,
     send_gcs, set_mode_auto, MissionStore, VehicleIds,
 };
-use mavlink::ardupilotmega::{MavMessage, MavModeFlag, MavMissionResult};
+use mavlink::ardupilotmega::{GpsFixType, MavMessage, MavModeFlag, MavMissionResult};
 use mavlink::{MavConnection, MavFrame};
 
 /// Horizontal distance (m) to consider a waypoint reached (same as TUI).
@@ -182,6 +183,24 @@ pub struct TelemetryCache {
     pub battery_current_a: Option<f32>,
     /// Remaining capacity percent when reported (0–100).
     pub battery_remaining_pct: Option<i8>,
+    /// From GPS_RAW_INT `fix_type`.
+    pub gps_fix: Option<String>,
+    pub gps_sats: Option<u8>,
+    pub gps_hdop: Option<f32>,
+}
+
+fn gps_fix_short(f: GpsFixType) -> &'static str {
+    match f {
+        GpsFixType::GPS_FIX_TYPE_NO_GPS => "NO_GPS",
+        GpsFixType::GPS_FIX_TYPE_NO_FIX => "NO_FIX",
+        GpsFixType::GPS_FIX_TYPE_2D_FIX => "2D",
+        GpsFixType::GPS_FIX_TYPE_3D_FIX => "3D",
+        GpsFixType::GPS_FIX_TYPE_DGPS => "DGPS",
+        GpsFixType::GPS_FIX_TYPE_RTK_FLOAT => "RTK_FLT",
+        GpsFixType::GPS_FIX_TYPE_RTK_FIXED => "RTK_FIX",
+        GpsFixType::GPS_FIX_TYPE_STATIC => "STATIC",
+        GpsFixType::GPS_FIX_TYPE_PPP => "PPP",
+    }
 }
 
 fn telem_update_from_frame(cache: &mut TelemetryCache, frame: &MavFrame<MavMessage>) {
@@ -225,6 +244,15 @@ fn telem_update_from_frame(cache: &mut TelemetryCache, frame: &MavFrame<MavMessa
             cache.home_lon_deg = Some(d.longitude as f64 / 1e7);
             cache.home_alt_m = Some(d.altitude as f64 / 1000.0);
         }
+        MavMessage::GPS_RAW_INT(d) => {
+            cache.gps_fix = Some(gps_fix_short(d.fix_type).to_string());
+            cache.gps_sats = Some(d.satellites_visible);
+            cache.gps_hdop = if d.eph == u16::MAX {
+                None
+            } else {
+                Some(d.eph as f32 / 100.0)
+            };
+        }
         _ => {}
     }
 }
@@ -238,6 +266,7 @@ pub fn spawn_http_mavlink_recv_thread<C>(
     flight_log: LogsHub,
     telemetry_hub: TelemetryHub,
     link_info: LinkInfo,
+    completion_hub: CommandCompletionHub,
 ) -> thread::JoinHandle<()>
 where
     C: MavConnection<MavMessage> + Send + Sync + 'static,
@@ -261,6 +290,10 @@ where
             }
 
             flight_log.log_mavlink_frame(&frame);
+
+            if let MavMessage::COMMAND_ACK(d) = &frame.msg {
+                completion_hub.on_command_ack(d.command, d.result);
+            }
 
             if let MavMessage::STATUSTEXT(d) = &frame.msg {
                 let text = d

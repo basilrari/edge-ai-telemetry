@@ -42,6 +42,12 @@ pub struct TelemetrySnapshot {
     pub battery_power_w: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub battery_remaining_pct: Option<i8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gps_fix: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gps_sats: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gps_hdop: Option<f32>,
     pub ts_ms: u64,
 }
 
@@ -78,6 +84,9 @@ impl TelemetrySnapshot {
             battery_current_a: t.battery_current_a,
             battery_power_w,
             battery_remaining_pct: t.battery_remaining_pct,
+            gps_fix: t.gps_fix.clone(),
+            gps_sats: t.gps_sats,
+            gps_hdop: t.gps_hdop,
             ts_ms: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)

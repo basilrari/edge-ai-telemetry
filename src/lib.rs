@@ -1,4 +1,5 @@
 pub mod mission;
+pub mod command_completion;
 pub mod cmd;
 pub mod geo;
 pub mod http_mission_tools;

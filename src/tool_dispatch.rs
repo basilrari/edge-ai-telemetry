@@ -1,7 +1,7 @@
 //! Map LLM / gateway **drone** tool names to MAVLink sends (ArduCopter-oriented).
 //!
 //! Optional JSON **`params`** on `POST /v1/apply-tool` (same object the gateway forwards):
-//! - **`arm`**: sends **GUIDED** (`DO_SET_MODE`) then **arm** — ArduPilot-friendly; the LLM does not need a separate `set_mode_guided` before `arm` for normal launch flows.
+//! - **`arm`**: sends **arm** only (current flight mode unchanged). Use **`set_mode_guided`** / **`takeoff`** separately when needed.
 //! - **`takeoff`**: optional `{"altitude_m": <m>}` (meters above home). `0` or omitted with no usable telemetry → **15 m**; omit with telemetry to use **current**
 //!   altitude above home from telemetry (`GLOBAL_POSITION_INT`). **`MAV_CMD_NAV_TAKEOFF` only** — use after **`arm`**.
 //! - **`mission_set_current`**: `{"seq": 0}` (required) — sets **current mission item index** on the FC (`DO_SET_MISSION_CURRENT`); does not upload a mission or replace **`start_mission`** for “fly the mission”.
@@ -148,15 +148,6 @@ where
 
     match tool {
         "arm" => {
-            let already_guided = telem
-                .and_then(|t| t.heartbeat_custom_mode)
-                .map(|m| m == CUSTOM_MODE_GUIDED)
-                .unwrap_or(false);
-            if !already_guided {
-                set_mode_guided_long(conn, ids).map_err(|e| e.to_string())?;
-                // USB serial: back-to-back writes can time out; brief pause before arm.
-                std::thread::sleep(Duration::from_millis(150));
-            }
             let msg = with_vehicle(arm(), ids);
             conn.send_default(&msg).map(|_| ()).map_err(|e| e.to_string())
         }
@@ -275,5 +266,23 @@ where
                 std::thread::sleep(Duration::from_millis(50));
             }
         }
+    }
+}
+
+/// MAVLink command we expect the FC to ACK for a single-tool apply (HTTP `wait_for=ack`).
+pub fn expected_ack_command(tool: &str) -> Option<MavCmd> {
+    match tool {
+        "arm" | "disarm" | "force_arm" => Some(MavCmd::MAV_CMD_COMPONENT_ARM_DISARM),
+        "takeoff" => Some(MavCmd::MAV_CMD_NAV_TAKEOFF),
+        "land_immediately" => Some(MavCmd::MAV_CMD_NAV_LAND),
+        "return_to_home" => Some(MavCmd::MAV_CMD_NAV_RETURN_TO_LAUNCH),
+        "goto_location" | "waypoint_inject" => Some(MavCmd::MAV_CMD_DO_REPOSITION),
+        "set_mode_auto" | "set_mode_guided" | "hover" | "circle_search" => {
+            Some(MavCmd::MAV_CMD_DO_SET_MODE)
+        }
+        "mission_set_current" => Some(MavCmd::MAV_CMD_DO_SET_MISSION_CURRENT),
+        "start_mission" => Some(MavCmd::MAV_CMD_MISSION_START),
+        "move_forward" | "retry_streams" => None,
+        _ => None,
     }
 }

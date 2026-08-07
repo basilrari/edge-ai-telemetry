@@ -19,6 +19,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use clap::Parser;
+use drone_server::command_completion::{CommandCompletionHub, CompletionStatus};
 use drone_server::logs_hub::LogsHub;
 use drone_server::http_mission_tools;
 use drone_server::mission_upload::{self, MissionUploadRequest};
@@ -27,7 +28,7 @@ use drone_server::mavlink_http_runtime::{
     arducopter_mode_name, spawn_http_mavlink_recv_thread, HttpOverrideState, TelemetryCache,
 };
 use drone_server::telemetry_hub::TelemetryHub;
-use drone_server::tool_dispatch::{apply_llm_drone_tool, LLM_DRONE_TOOL_NAMES};
+use drone_server::tool_dispatch::{apply_llm_drone_tool, expected_ack_command, LLM_DRONE_TOOL_NAMES};
 use drone_server::{MissionStore, VehicleIds};
 use mavlink::ardupilotmega::MavMessage;
 use mavlink::Connection;
@@ -57,6 +58,7 @@ struct AppState {
     telem: Arc<Mutex<TelemetryCache>>,
     logs: LogsHub,
     telemetry_hub: TelemetryHub,
+    completion_hub: CommandCompletionHub,
 }
 
 fn disconnected_link() -> LinkInfo {
@@ -95,6 +97,7 @@ fn spawn_mavlink_connector(
     logs: LogsHub,
     telemetry_hub: TelemetryHub,
     recv_join: Arc<Mutex<Option<JoinHandle<()>>>>,
+    completion_hub: CommandCompletionHub,
 ) {
     thread::spawn(move || {
         loop {
@@ -126,6 +129,7 @@ fn spawn_mavlink_connector(
                         logs.clone(),
                         telemetry_hub.clone(),
                         link,
+                        completion_hub.clone(),
                     );
                     if let Ok(mut slot) = recv_join.lock() {
                         *slot = Some(join);
@@ -153,6 +157,12 @@ struct ApplyToolBody {
     tool: String,
     #[serde(default = "default_empty_object")]
     params: serde_json::Value,
+    #[serde(default)]
+    step_id: Option<String>,
+    #[serde(default)]
+    wait_for: Option<String>,
+    #[serde(default)]
+    ack_timeout_ms: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -163,6 +173,18 @@ struct ApplyToolResponse {
     error: Option<String>,
     target_system: u8,
     target_component: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    step_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dispatch_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ack_wait_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    completion_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ack_result: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -218,6 +240,12 @@ struct TelemetryResponse {
     battery_power_w: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     battery_remaining_pct: Option<i8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    gps_fix: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    gps_sats: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    gps_hdop: Option<f32>,
 }
 
 #[derive(Serialize)]
@@ -336,6 +364,9 @@ async fn get_telemetry(State(state): State<Arc<AppState>>) -> Json<TelemetryResp
                 battery_current_a: None,
                 battery_power_w: None,
                 battery_remaining_pct: None,
+                gps_fix: None,
+                gps_sats: None,
+                gps_hdop: None,
             });
         }
     };
@@ -369,6 +400,9 @@ async fn get_telemetry(State(state): State<Arc<AppState>>) -> Json<TelemetryResp
         battery_current_a: t.battery_current_a,
         battery_power_w,
         battery_remaining_pct: t.battery_remaining_pct,
+        gps_fix: t.gps_fix.clone(),
+        gps_sats: t.gps_sats,
+        gps_hdop: t.gps_hdop,
     })
 }
 
@@ -693,6 +727,15 @@ async fn handle_telemetry_ws(mut socket: WebSocket, state: Arc<AppState>) {
     }
 }
 
+struct ApplyBlockingOutcome {
+    mavlink_ok: bool,
+    error: Option<String>,
+    dispatch_ms: u64,
+    ack_wait_ms: Option<u64>,
+    completion_status: Option<String>,
+    ack_result: Option<String>,
+}
+
 async fn post_apply_tool(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -716,65 +759,159 @@ async fn post_apply_tool(
         format!("apply_tool: {} params={}", body.tool, body.params),
     );
 
+    let wait_for_ack = body.wait_for.as_deref() == Some("ack");
+    let ack_timeout = Duration::from_millis(body.ack_timeout_ms.unwrap_or(3000));
+    let step_id = body
+        .step_id
+        .clone()
+        .unwrap_or_else(|| rid.clone());
+
     let tool_for_blocking = body.tool.clone();
     let params_for_blocking = body.params.clone();
     let st = Arc::clone(&state);
     let tool_name_for_log = body.tool.clone();
+    let step_id_blocking = step_id.clone();
+    let wait_for_ack_blocking = wait_for_ack;
 
     let result = tokio::task::spawn_blocking(move || {
-        let conn = require_conn(&st)?;
-        let ids = st
-            .vehicle_ids
-            .lock()
-            .map(|g| *g)
-            .map_err(|e| format!("vehicle_ids_lock:{e}"))?;
-        match tool_for_blocking.as_str() {
-            "mission_interrupt" => http_mission_tools::mission_interrupt(
-                conn.as_ref(),
-                ids,
-                &st.mission,
-                &st.override_state,
-                &st.telem,
-            ),
-            "mission_resume" => http_mission_tools::mission_resume(
-                conn.as_ref(),
-                ids,
-                &st.mission,
-                &st.override_state,
-            ),
-            "waypoint_inject" => http_mission_tools::waypoint_inject(
-                conn.as_ref(),
-                ids,
-                &st.mission,
-                &st.override_state,
-                &st.telem,
-                &params_for_blocking,
-            ),
-            "goto_location" => apply_llm_drone_tool(
-                conn.as_ref(),
-                ids,
-                "goto_location",
-                &params_for_blocking,
-                None,
-            ),
-            "start_mission" => {
-                let telem_guard = st.telem.lock().map_err(|e| format!("telem_lock:{e}"))?;
-                mission_upload::start_auto_mission(
+        let dispatch_start = std::time::Instant::now();
+        let expect_cmd = expected_ack_command(&tool_for_blocking);
+        if wait_for_ack_blocking {
+            if let Some(cmd) = expect_cmd {
+                st.completion_hub
+                    .register(step_id_blocking.clone(), cmd);
+            }
+        }
+
+        let send_result: Result<(), String> = (|| {
+            let conn = require_conn(&st)?;
+            let ids = st
+                .vehicle_ids
+                .lock()
+                .map(|g| *g)
+                .map_err(|e| format!("vehicle_ids_lock:{e}"))?;
+            match tool_for_blocking.as_str() {
+                "mission_interrupt" => http_mission_tools::mission_interrupt(
                     conn.as_ref(),
                     ids,
                     &st.mission,
-                    &telem_guard,
-                )
-            }
-            _ => {
-                let telem_guard = st.telem.lock().map_err(|e| format!("telem_lock:{e}"))?;
-                apply_llm_drone_tool(
+                    &st.override_state,
+                    &st.telem,
+                ),
+                "mission_resume" => http_mission_tools::mission_resume(
                     conn.as_ref(),
                     ids,
-                    &tool_for_blocking,
+                    &st.mission,
+                    &st.override_state,
+                ),
+                "waypoint_inject" => http_mission_tools::waypoint_inject(
+                    conn.as_ref(),
+                    ids,
+                    &st.mission,
+                    &st.override_state,
+                    &st.telem,
                     &params_for_blocking,
-                    Some(&*telem_guard),
-                )
+                ),
+                "goto_location" => apply_llm_drone_tool(
+                    conn.as_ref(),
+                    ids,
+                    "goto_location",
+                    &params_for_blocking,
+                    None,
+                ),
+                "start_mission" => {
+                    let telem_guard = st.telem.lock().map_err(|e| format!("telem_lock:{e}"))?;
+                    mission_upload::start_auto_mission(
+                        conn.as_ref(),
+                        ids,
+                        &st.mission,
+                        &telem_guard,
+                    )
+                }
+                _ => {
+                    let telem_guard = st.telem.lock().map_err(|e| format!("telem_lock:{e}"))?;
+                    apply_llm_drone_tool(
+                        conn.as_ref(),
+                        ids,
+                        &tool_for_blocking,
+                        &params_for_blocking,
+                        Some(&*telem_guard),
+                    )
+                }
+            }
+        })();
+
+        let dispatch_ms = dispatch_start.elapsed().as_millis() as u64;
+
+        if wait_for_ack_blocking {
+            match send_result {
+                Ok(()) => {
+                    if let Some(_cmd) = expect_cmd {
+                        let ack_out =
+                            st.completion_hub
+                                .wait(&step_id_blocking, ack_timeout);
+                        st.completion_hub.unregister(&step_id_blocking);
+                        let ok = ack_out.status == CompletionStatus::Acked;
+                        let err = if ok {
+                            None
+                        } else {
+                            Some(format!(
+                                "ack_{}: {:?}",
+                                ack_out.status.as_str(),
+                                ack_out.ack_result
+                            ))
+                        };
+                        Ok(ApplyBlockingOutcome {
+                            mavlink_ok: ok,
+                            error: err,
+                            dispatch_ms,
+                            ack_wait_ms: Some(ack_out.ack_wait_ms),
+                            completion_status: Some(ack_out.status.as_str().to_string()),
+                            ack_result: ack_out.ack_result,
+                        })
+                    } else {
+                        Ok(ApplyBlockingOutcome {
+                            mavlink_ok: true,
+                            error: None,
+                            dispatch_ms,
+                            ack_wait_ms: Some(0),
+                            completion_status: Some(CompletionStatus::NotApplicable.as_str().to_string()),
+                            ack_result: None,
+                        })
+                    }
+                }
+                Err(e) => {
+                    st.completion_hub.unregister(&step_id_blocking);
+                    Ok(ApplyBlockingOutcome {
+                        mavlink_ok: false,
+                        error: Some(e),
+                        dispatch_ms,
+                        ack_wait_ms: None,
+                        completion_status: Some(
+                            CompletionStatus::DispatchFailed.as_str().to_string(),
+                        ),
+                        ack_result: None,
+                    })
+                }
+            }
+        } else {
+            match send_result {
+                Ok(()) => Ok(ApplyBlockingOutcome {
+                    mavlink_ok: true,
+                    error: None,
+                    dispatch_ms,
+                    ack_wait_ms: None,
+                    completion_status: None,
+                    ack_result: None,
+                }),
+                Err(e) => Ok(ApplyBlockingOutcome {
+                    mavlink_ok: false,
+                    error: Some(e),
+                    dispatch_ms,
+                    ack_wait_ms: None,
+                    completion_status: Some(CompletionStatus::DispatchFailed.as_str().to_string()),
+                    ack_result: None,
+                }),
             }
         }
     })
@@ -786,15 +923,32 @@ async fn post_apply_tool(
         .map(|g| *g)
         .unwrap_or_default();
 
+    let mut dispatch_ms = None;
+    let mut ack_wait_ms = None;
+    let mut completion_status = None;
+    let mut ack_result = None;
+
     let (ok, err) = match result {
-        Ok(Ok(())) => {
-            info!(request_id = %rid, tool = %tool_name_for_log, "apply_tool: MAVLink send OK");
-            state.logs.push_flight("info", format!("OK: {tool_name_for_log}"));
-            (true, None)
+        Ok(Ok(outcome)) => {
+            dispatch_ms = Some(outcome.dispatch_ms);
+            ack_wait_ms = outcome.ack_wait_ms;
+            completion_status = outcome.completion_status;
+            ack_result = outcome.ack_result;
+            if outcome.mavlink_ok {
+                info!(request_id = %rid, tool = %tool_name_for_log, "apply_tool: OK");
+                state.logs.push_flight("info", format!("OK: {tool_name_for_log}"));
+                (true, None)
+            } else {
+                let e = outcome
+                    .error
+                    .unwrap_or_else(|| "apply failed".to_string());
+                warn!(request_id = %rid, tool = %tool_name_for_log, error = %e, "apply_tool: failed");
+                state.logs.push_flight("warn", format!("FAIL {tool_name_for_log}: {e}"));
+                (false, Some(e))
+            }
         }
         Ok(Err(e)) => {
-            warn!(request_id = %rid, tool = %tool_name_for_log, error = %e, "apply_tool: MAVLink or tool error");
-            state.logs.push_flight("warn", format!("FAIL {tool_name_for_log}: {e}"));
+            error!(request_id = %rid, error = %e, "apply_tool: blocking error");
             (false, Some(e))
         }
         Err(join_err) => {
@@ -817,6 +971,12 @@ async fn post_apply_tool(
             error: err,
             target_system: ids_resp.system_id,
             target_component: ids_resp.component_id,
+            step_id: Some(step_id),
+            request_id: Some(rid),
+            dispatch_ms,
+            ack_wait_ms,
+            completion_status,
+            ack_result,
         }),
     )
 }
@@ -849,6 +1009,7 @@ async fn main() {
     let telem = Arc::new(Mutex::new(TelemetryCache::default()));
     let telemetry_hub = TelemetryHub::new();
 
+    let completion_hub = CommandCompletionHub::default();
     spawn_mavlink_connector(
         args.mavlink.clone(),
         Arc::clone(&conn_slot),
@@ -860,6 +1021,7 @@ async fn main() {
         logs.clone(),
         telemetry_hub.clone(),
         Arc::clone(&recv_join),
+        completion_hub.clone(),
     );
 
     let state = Arc::new(AppState {
@@ -871,6 +1033,7 @@ async fn main() {
         telem,
         logs,
         telemetry_hub,
+        completion_hub,
     });
 
     let ids_display = vehicle_ids.lock().map(|g| *g).unwrap_or_default();
