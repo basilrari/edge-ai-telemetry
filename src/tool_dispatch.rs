@@ -20,7 +20,6 @@ use crate::mavlink_http_runtime::{
 use crate::{
     arm, disarm, force_arm, goto_global_command_int, land, mission_set_current, mission_start, rtl,
     set_mode_auto, set_mode_guided, set_mode_guided_long, takeoff_alt, with_vehicle, VehicleIds,
-    CUSTOM_MODE_GUIDED,
 };
 use std::time::Duration;
 use mavlink::ardupilotmega::{
@@ -42,6 +41,7 @@ pub const LLM_DRONE_TOOL_NAMES: &[&str] = &[
     "mission_set_current",
     "goto_location",
     "move_forward",
+    "loiter",
     "hover",
     "return_to_home",
     "land_immediately",
@@ -53,6 +53,7 @@ pub const LLM_DRONE_TOOL_NAMES: &[&str] = &[
 ];
 
 const MODE_FLAG_CUSTOM_MODE_ENABLED: f32 = 1.0;
+const ARDUCOPTER_MODE_LOITER: f32 = 5.0;
 const ARDUCOPTER_MODE_CIRCLE: f32 = 7.0;
 
 fn set_arducopter_mode_long<C>(
@@ -157,7 +158,9 @@ where
         }
         "force_arm" => force_arm(conn, ids).map_err(|e| e.to_string()),
         "set_mode_auto" => set_mode_auto(conn, ids).map_err(|e| e.to_string()),
-        "set_mode_guided" | "hover" => set_mode_guided_long(conn, ids).map_err(|e| e.to_string()),
+        "set_mode_guided" => set_mode_guided_long(conn, ids).map_err(|e| e.to_string()),
+        "loiter" | "hover" => set_arducopter_mode_long(conn, ids, ARDUCOPTER_MODE_LOITER)
+            .map_err(|e| e.to_string()),
         "takeoff" => {
             let alt = if params.get("altitude_m").is_some() {
                 altitude_above_home_from_params(&params, "altitude_m")
@@ -277,7 +280,7 @@ pub fn expected_ack_command(tool: &str) -> Option<MavCmd> {
         "land_immediately" => Some(MavCmd::MAV_CMD_NAV_LAND),
         "return_to_home" => Some(MavCmd::MAV_CMD_NAV_RETURN_TO_LAUNCH),
         "goto_location" | "waypoint_inject" => Some(MavCmd::MAV_CMD_DO_REPOSITION),
-        "set_mode_auto" | "set_mode_guided" | "hover" | "circle_search" => {
+        "set_mode_auto" | "set_mode_guided" | "loiter" | "hover" | "circle_search" => {
             Some(MavCmd::MAV_CMD_DO_SET_MODE)
         }
         "mission_set_current" => Some(MavCmd::MAV_CMD_DO_SET_MISSION_CURRENT),
