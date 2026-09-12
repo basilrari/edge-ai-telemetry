@@ -95,7 +95,6 @@ pub(crate) struct Waypoint {
     pub(crate) lat: f64,
     pub(crate) lon: f64,
     pub(crate) alt: f32,
-    #[allow(dead_code)]
     pub(crate) frame: u8,
 }
 

@@ -29,16 +29,12 @@ impl CompletionStatus {
 #[derive(Debug, Clone)]
 pub struct AckWaitOutcome {
     pub status: CompletionStatus,
-    pub ack_command: Option<String>,
     pub ack_result: Option<String>,
     pub ack_wait_ms: u64,
 }
 
 struct PendingEntry {
     step_id: String,
-    expect_cmd: MavCmd,
-    resolved: Option<MavResult>,
-    registered_at: Instant,
 }
 
 #[derive(Default)]
@@ -62,9 +58,6 @@ impl CommandCompletionHub {
         g.by_id.remove(&step_id);
         g.queues.entry(key).or_default().push_back(PendingEntry {
             step_id: step_id.clone(),
-            expect_cmd,
-            resolved: None,
-            registered_at: Instant::now(),
         });
         drop(g);
         cv.notify_all();
@@ -86,9 +79,8 @@ impl CommandCompletionHub {
         let mut g = lock.lock().expect("completion hub lock");
         let key = cmd_key(cmd);
         if let Some(q) = g.queues.get_mut(&key) {
-            if let Some(mut entry) = q.pop_front() {
-                entry.resolved = Some(result);
-                g.by_id.insert(entry.step_id.clone(), result);
+            if let Some(entry) = q.pop_front() {
+                g.by_id.insert(entry.step_id, result);
             }
         }
         drop(g);
@@ -110,7 +102,6 @@ impl CommandCompletionHub {
                 };
                 return AckWaitOutcome {
                     status,
-                    ack_command: None,
                     ack_result: Some(format!("{result:?}")),
                     ack_wait_ms: start.elapsed().as_millis() as u64,
                 };
@@ -123,12 +114,11 @@ impl CommandCompletionHub {
                 g.by_id.remove(step_id);
                 return AckWaitOutcome {
                     status: CompletionStatus::Timeout,
-                    ack_command: None,
                     ack_result: None,
                     ack_wait_ms: start.elapsed().as_millis() as u64,
                 };
             }
-            g = cv
+            let _g = cv
                 .wait_timeout(g, remaining)
                 .expect("completion hub wait")
                 .0;
@@ -138,10 +128,6 @@ impl CommandCompletionHub {
 
 fn cmd_key(cmd: MavCmd) -> u32 {
     cmd as u32
-}
-
-pub fn mav_result_accepted(result: MavResult) -> bool {
-    result == MavResult::MAV_RESULT_ACCEPTED
 }
 
 #[cfg(test)]

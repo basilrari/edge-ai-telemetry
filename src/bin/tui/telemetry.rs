@@ -138,7 +138,7 @@ pub(crate) fn apply_message(state: &mut TelemetryState, frame: &MavFrame<MavMess
             state.home_alt = Some(d.altitude as f64 / 1000.0);
         }
         MavMessage::SYS_STATUS(d) => {
-            state.vbat = crate::mavlink_http_runtime::sys_status_voltage_v(d.voltage_battery);
+            state.vbat = drone_server::mavlink_http_runtime::sys_status_voltage_v(d.voltage_battery);
             state.sys_voltage = state.vbat;
             if d.current_battery >= 0 {
                 state.sys_current = Some(d.current_battery as f32 / 100.0);

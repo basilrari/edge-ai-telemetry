@@ -83,67 +83,30 @@ pub fn with_vehicle(mut msg: MavMessage, ids: VehicleIds) -> MavMessage {
     msg
 }
 
-/// TUI `g`: `MAV_CMD_DO_SET_MODE` → ArduCopter GUIDED (custom mode 4).
-pub fn set_mode_guided_long<C>(conn: &C, ids: VehicleIds) -> Result<(), mavlink::error::MessageWriteError>
+/// `MAV_CMD_DO_SET_MODE` → ArduCopter GUIDED (custom mode 4).
+pub fn set_mode_guided<C>(conn: &C, ids: VehicleIds) -> Result<(), mavlink::error::MessageWriteError>
 where
     C: MavConnection<MavMessage>,
 {
     ardupilot_set_custom_mode(conn, ids, CUSTOM_MODE_GUIDED as f32)
 }
 
-/// TUI `u`: `MAV_CMD_DO_SET_MODE` → ArduCopter AUTO (custom mode 3).
-pub fn set_mode_auto_long<C>(conn: &C, ids: VehicleIds) -> Result<(), mavlink::error::MessageWriteError>
+/// `MAV_CMD_DO_SET_MODE` → ArduCopter AUTO (custom mode 3).
+pub fn set_mode_auto<C>(conn: &C, ids: VehicleIds) -> Result<(), mavlink::error::MessageWriteError>
 where
     C: MavConnection<MavMessage>,
 {
     ardupilot_set_custom_mode(conn, ids, CUSTOM_MODE_AUTO as f32)
 }
 
-/// Same as [`set_mode_guided_long`] (HTTP tools and interrupt path use this name).
-pub fn set_mode_guided<C>(conn: &C, ids: VehicleIds) -> Result<(), mavlink::error::MessageWriteError>
-where
-    C: MavConnection<MavMessage>,
-{
-    set_mode_guided_long(conn, ids)
-}
-
-/// Same as [`set_mode_auto_long`].
-pub fn set_mode_auto<C>(conn: &C, ids: VehicleIds) -> Result<(), mavlink::error::MessageWriteError>
-where
-    C: MavConnection<MavMessage>,
-{
-    set_mode_auto_long(conn, ids)
-}
-
 /// Default takeoff altitude in meters when not specified.
 pub const DEFAULT_TAKEOFF_ALTITUDE_M: f32 = 10.0;
-
-/// Build a COMMAND_LONG that commands takeoff.
-/// Uses a default altitude of 10 m if not specified by the MAV_CMD_NAV_TAKEOFF semantics (param7).
-pub fn takeoff() -> MavMessage {
-    takeoff_alt(DEFAULT_TAKEOFF_ALTITUDE_M)
-}
 
 /// Build a COMMAND_LONG that commands takeoff to the given altitude (meters).
 pub fn takeoff_alt(altitude_m: f32) -> MavMessage {
     MavMessage::COMMAND_LONG(COMMAND_LONG_DATA {
         param7: altitude_m,
         command: MavCmd::MAV_CMD_NAV_TAKEOFF,
-        ..COMMAND_LONG_DATA::default()
-    })
-}
-
-/// Build a COMMAND_LONG that repositions the vehicle to a global position (guided).
-/// Latitude and longitude in degrees; altitude in meters (e.g. AMSL or relative per frame).
-/// Uses MAV_CMD_DO_REPOSITION (param5=lat, param6=lon, param7=alt).
-/// Note: ArduCopter often rejects COMMAND_LONG for DO_REPOSITION (MAV_RESULT_COMMAND_INT_ONLY);
-/// use [goto_global_command_int] for reliable guided reposition.
-pub fn goto_global(lat_deg: f64, lon_deg: f64, altitude_m: f64) -> MavMessage {
-    MavMessage::COMMAND_LONG(COMMAND_LONG_DATA {
-        param5: lat_deg as f32,
-        param6: lon_deg as f32,
-        param7: altitude_m as f32,
-        command: MavCmd::MAV_CMD_DO_REPOSITION,
         ..COMMAND_LONG_DATA::default()
     })
 }

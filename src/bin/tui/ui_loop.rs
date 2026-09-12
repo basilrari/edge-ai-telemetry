@@ -7,7 +7,8 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use drone_server::{
-    force_arm, goto_global_command_int, land, rtl, set_mode_guided, MissionStore, VehicleIds,
+    arm, disarm, force_arm, goto_global_command_int, land, mission_start_message, rtl,
+    set_mode_auto, set_mode_guided, takeoff_alt, with_vehicle, MissionStore, VehicleIds,
 };
 use mavlink::ardupilotmega::{MavCmd, MavMessage};
 use mavlink::{MavConnection, MavFrame};
@@ -15,10 +16,6 @@ use ratatui::Terminal;
 
 use crate::consts::{TARGET_COMPONENT, TARGET_SYSTEM};
 use drone_server::geo::parse_waypoint_input;
-use crate::mavlink_cmd::{
-    cmd_arm, cmd_disarm, cmd_mission_start, cmd_set_mode_auto_long, cmd_set_mode_guided_long,
-    cmd_takeoff_alt, with_vehicle,
-};
 use crate::render::draw_ui;
 use crate::state::{
     NetWatchdogStatus, OverrideState, PendingFeedback, TelemetryState, vehicle_ids_from_state,
@@ -159,7 +156,7 @@ pub(crate) fn run_ui<C: MavConnection<MavMessage> + Send>(
                     KeyCode::Char('a') => {
                         let ids = vehicle_ids_from_state(&state);
                         if let Ok(c) = conn.lock() {
-                            let msg = with_vehicle(cmd_arm(), ids);
+                            let msg = with_vehicle(arm(), ids);
                             log_outgoing(
                                 &mut state,
                                 PendingFeedback::new(
@@ -174,7 +171,7 @@ pub(crate) fn run_ui<C: MavConnection<MavMessage> + Send>(
                     KeyCode::Char('d') => {
                         let ids = vehicle_ids_from_state(&state);
                         if let Ok(c) = conn.lock() {
-                            let msg = with_vehicle(cmd_disarm(), ids);
+                            let msg = with_vehicle(disarm(), ids);
                             log_outgoing(
                                 &mut state,
                                 PendingFeedback::new(
@@ -189,7 +186,7 @@ pub(crate) fn run_ui<C: MavConnection<MavMessage> + Send>(
                     KeyCode::Char('g') => {
                         let ids = vehicle_ids_from_state(&state);
                         if let Ok(mut c) = conn.lock() {
-                            let r = cmd_set_mode_guided_long(&mut *c, ids);
+                            let r = set_mode_guided(&mut *c, ids);
                             log_outgoing(
                                 &mut state,
                                 PendingFeedback::new(
@@ -204,7 +201,7 @@ pub(crate) fn run_ui<C: MavConnection<MavMessage> + Send>(
                     KeyCode::Char('u') => {
                         let ids = vehicle_ids_from_state(&state);
                         if let Ok(mut c) = conn.lock() {
-                            let r = cmd_set_mode_auto_long(&mut *c, ids);
+                            let r = set_mode_auto(&mut *c, ids);
                             log_outgoing(
                                 &mut state,
                                 PendingFeedback::new(
@@ -256,8 +253,8 @@ pub(crate) fn run_ui<C: MavConnection<MavMessage> + Send>(
                             }
                         }
                         if let Ok(mut c) = conn.lock() {
-                            let r1 = cmd_set_mode_auto_long(&mut *c, ids);
-                            let msg = cmd_mission_start(ids);
+                            let r1 = set_mode_auto(&mut *c, ids);
+                            let msg = mission_start_message(ids);
                             let r2 = c.send_default(&msg);
                             log_outgoing_two(
                                 &mut state,
@@ -275,7 +272,7 @@ pub(crate) fn run_ui<C: MavConnection<MavMessage> + Send>(
                     KeyCode::Char('t') => {
                         let ids = vehicle_ids_from_state(&state);
                         if let Ok(c) = conn.lock() {
-                            let msg = with_vehicle(cmd_takeoff_alt(10.0), ids);
+                            let msg = with_vehicle(takeoff_alt(10.0), ids);
                             log_outgoing(
                                 &mut state,
                                 PendingFeedback::new(

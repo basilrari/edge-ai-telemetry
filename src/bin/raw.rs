@@ -242,7 +242,7 @@ fn main() {
                         println!("HOME lat={:.6} lon={:.6} alt={:.1}m", lat_deg, lon_deg, alt_m);
                     }
                     MavMessage::SYS_STATUS(d) => {
-                        let vbat_v = crate::mavlink_http_runtime::sys_status_voltage_v(d.voltage_battery)
+                        let vbat_v = drone_server::mavlink_http_runtime::sys_status_voltage_v(d.voltage_battery)
                             .map(|v| format!("{v:.2}"))
                             .unwrap_or_else(|| "?".into());
                         let batt_pct = if d.battery_remaining < 0 {

@@ -1,4 +1,3 @@
-pub mod mission;
 pub mod command_completion;
 pub mod cmd;
 pub mod geo;
@@ -19,11 +18,9 @@ pub use mavlink_streams::{heartbeat_from_autopilot, refresh_mavlink_streams, req
 
 // Re-export command helpers for building MAVLink messages.
 pub use cmd::{
-    arm, disarm, force_arm, land, rtl, set_mode_auto, set_mode_auto_long, set_mode_guided,
-    set_mode_guided_long, takeoff, takeoff_alt, with_vehicle, goto_global, goto_global_command_int,
-    mission_set_current, mission_start, mission_start_message, resume_mission_execution, send_gcs,
-    gcs_header, GCS_COMPONENT_ID, GCS_SYSTEM_ID, VehicleIds,
-    DEFAULT_TAKEOFF_ALTITUDE_M,
-    CUSTOM_MODE_GUIDED, CUSTOM_MODE_AUTO,
+    arm, disarm, force_arm, land, rtl, set_mode_auto, set_mode_guided, takeoff_alt, with_vehicle,
+    goto_global_command_int, mission_set_current, mission_start, mission_start_message,
+    resume_mission_execution, send_gcs, gcs_header, GCS_COMPONENT_ID, GCS_SYSTEM_ID, VehicleIds,
+    DEFAULT_TAKEOFF_ALTITUDE_M, CUSTOM_MODE_GUIDED, CUSTOM_MODE_AUTO,
 };
 pub use mission_store::{MissionStore, StoredMissionItem};

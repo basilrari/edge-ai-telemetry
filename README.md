@@ -16,12 +16,11 @@
 
 | Area | Purpose |
 |------|---------|
-| **`cmd`** | Build and send common ArduPilotMega commands: arm/disarm/force_arm, land, RTL, guided/auto modes, takeoff, global goto (`COMMAND_INT` / helpers), mission set-current and mission start. |
-| **`mission`** | Small, serde-friendly mission types (`Waypoint`, `Mission`, `WaypointCommand`) for describing missions in JSON or internal APIs—not a full mission-protocol implementation by itself. |
+| **`cmd`** | Build and send common ArduPilotMega commands: arm/disarm/force_arm, land, RTL, guided/auto modes, takeoff, global goto (`COMMAND_INT`), mission set-current and mission start. |
 | **`mission_store`** | Runtime state for the TUI: mission items downloaded from the FC, current sequence, snapshot for interrupt/override, and pending upload items when resuming a mission after override. |
 | **`mavlink_connect`** | Shared CLI parsing for binaries: default UDP listen URL, `--serial` with optional device and baud, `tune_connection` (e.g. accept MAVLink v1+v2), help text, and friendly open-error messages for serial permission/busy/device issues. |
 
-**Re-exported at the crate root** (see `src/lib.rs`): `arm`, `disarm`, `force_arm`, `land`, `rtl`, `set_mode_auto`, `set_mode_guided`, `takeoff`, `takeoff_alt`, `goto_global`, `goto_global_command_int`, `mission_set_current`, `mission_start`, `VehicleIds`, altitude/mode constants, plus `MissionStore`, `StoredMissionItem`.
+**Re-exported at the crate root** (see `src/lib.rs`): `arm`, `disarm`, `force_arm`, `land`, `rtl`, `set_mode_auto`, `set_mode_guided`, `takeoff_alt`, `goto_global_command_int`, `mission_set_current`, `mission_start`, `VehicleIds`, altitude/mode constants, plus `MissionStore`, `StoredMissionItem`.
 
 ### Binary: `tui` (default)
 
@@ -116,7 +115,6 @@ drone-server/
 └── src/
     ├── lib.rs              # Crate root: modules + public re-exports
     ├── cmd.rs              # MAVLink command builders and send helpers
-    ├── mission.rs          # Serde mission types
     ├── mission_store.rs    # FC mission mirror + override snapshot/upload state
     ├── mavlink_connect.rs  # URL resolution, CLI help, connection tuning
     ├── flight_log.rs       # Flight event log entries
