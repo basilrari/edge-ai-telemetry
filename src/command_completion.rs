@@ -1,7 +1,7 @@
 //! Correlate outbound MAVLink commands with inbound `COMMAND_ACK` for HTTP apply-tool.
 
 use mavlink::ardupilotmega::{MavCmd, MavResult};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -33,15 +33,11 @@ pub struct AckWaitOutcome {
     pub ack_wait_ms: u64,
 }
 
-struct PendingEntry {
-    step_id: String,
-}
-
 #[derive(Default)]
 struct HubInner {
     /// FIFO per expected command (one ACK satisfies the oldest pending waiter).
-    queues: std::collections::HashMap<u32, VecDeque<PendingEntry>>,
-    by_id: std::collections::HashMap<String, MavResult>,
+    queues: HashMap<u32, VecDeque<String>>,
+    by_id: HashMap<String, MavResult>,
 }
 
 /// Shared between the MAVLink recv thread and HTTP apply-tool workers.
@@ -56,9 +52,7 @@ impl CommandCompletionHub {
         let mut g = lock.lock().expect("completion hub lock");
         let key = cmd_key(expect_cmd);
         g.by_id.remove(&step_id);
-        g.queues.entry(key).or_default().push_back(PendingEntry {
-            step_id: step_id.clone(),
-        });
+        g.queues.entry(key).or_default().push_back(step_id);
         drop(g);
         cv.notify_all();
     }
@@ -68,7 +62,7 @@ impl CommandCompletionHub {
         let mut g = lock.lock().expect("completion hub lock");
         g.by_id.remove(step_id);
         for q in g.queues.values_mut() {
-            q.retain(|e| e.step_id != step_id);
+            q.retain(|id| id != step_id);
         }
         drop(g);
         cv.notify_all();
@@ -79,8 +73,8 @@ impl CommandCompletionHub {
         let mut g = lock.lock().expect("completion hub lock");
         let key = cmd_key(cmd);
         if let Some(q) = g.queues.get_mut(&key) {
-            if let Some(entry) = q.pop_front() {
-                g.by_id.insert(entry.step_id, result);
+            if let Some(id) = q.pop_front() {
+                g.by_id.insert(id, result);
             }
         }
         drop(g);
@@ -109,7 +103,7 @@ impl CommandCompletionHub {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 for q in g.queues.values_mut() {
-                    q.retain(|e| e.step_id != step_id);
+                    q.retain(|id| id != step_id);
                 }
                 g.by_id.remove(step_id);
                 return AckWaitOutcome {
@@ -118,10 +112,11 @@ impl CommandCompletionHub {
                     ack_wait_ms: start.elapsed().as_millis() as u64,
                 };
             }
-            let _g = cv
-                .wait_timeout(g, remaining)
-                .expect("completion hub wait")
-                .0;
+            drop(
+                cv.wait_timeout(g, remaining)
+                    .expect("completion hub wait")
+                    .0,
+            );
         }
     }
 }

@@ -18,6 +18,7 @@ Detailed map of this crate for AI assistants and maintainers: **what lives where
 |---------------|----------------|
 | **`lib.rs`** | Declares `cmd`, `mission_store`, `mavlink_connect`, HTTP helpers. Re-exports command helpers so callers can `use drone_server::rtl` etc. |
 | **`cmd.rs`** | ArduPilotMega-oriented helpers: `VehicleIds`, arm/disarm/force_arm, land, RTL, `set_mode_guided` / `set_mode_auto`, `takeoff_alt`, `goto_global_command_int`, `mission_set_current`, `mission_start`. Returns `MavMessage` or sends on `MavConnection` as appropriate. |
+| **`geo.rs`** | `parse_waypoint_input` (lat lon alt or alt-only with current position), `horizontal_distance_m` for override “reached waypoint” logic. Shared by TUI and HTTP tools. |
 | **`mission_store.rs`** | **TUI-centric but in the library** so tests and future APIs can reuse it: stores `MISSION_ITEM_INT` payloads from the FC, `MISSION_CURRENT`, optional **snapshot** `(items, seq)` for interrupt/override, **`upload_pending`** for FC-driven mission item upload during resume, and flags like `upload_done`. Methods: `update_from_item`, `update_current_seq`, `ensure_snapshot_for_pause`, `get_snapshot`, `set_upload_pending`, `take_upload_item`, `set_upload_done`, etc. |
 | **`mavlink_connect.rs`** | Binary-facing utilities: `DEFAULT_UDP_URL`, serial defaults, `resolve_from_args`, `usage_string`, `open_error_message`, `tune_connection` (e.g. `set_allow_recv_any_version`). Keeps UDP vs serial URL construction and CLI parsing in one place. |
 
