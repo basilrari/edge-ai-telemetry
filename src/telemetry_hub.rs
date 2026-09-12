@@ -122,8 +122,12 @@ impl TelemetryHub {
         }
         *gate = Instant::now();
         drop(gate);
-        let snap = TelemetrySnapshot::from_cache(link, telem);
-        let _ = self.tx.send(snap);
+        self.publish(link, telem);
+    }
+
+    /// Always publish (link-down). Skips the 10 Hz gate so subscribers do not keep the last live pin.
+    pub fn publish(&self, link: &LinkInfo, telem: &TelemetryCache) {
+        let _ = self.tx.send(TelemetrySnapshot::from_cache(link, telem));
     }
 
     pub fn snapshot_now(&self, link: &LinkInfo, telem: &TelemetryCache) -> TelemetrySnapshot {

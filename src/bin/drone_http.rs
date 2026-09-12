@@ -144,6 +144,7 @@ fn spawn_mavlink_connector(
                     if let Ok(mut slot) = link_slot.lock() {
                         *slot = disconnected_link();
                     }
+                    telemetry_hub.publish(&disconnected_link(), &TelemetryCache::default());
                     warn!("MAVLink recv ended; reconnecting");
                     thread::sleep(Duration::from_secs(1));
                 }
@@ -163,10 +164,6 @@ fn default_empty_object() -> serde_json::Value {
     serde_json::json!({})
 }
 
-fn default_wait_for_ack() -> Option<String> {
-    Some("ack".to_string())
-}
-
 #[derive(Deserialize)]
 struct ApplyToolBody {
     tool: String,
@@ -174,7 +171,7 @@ struct ApplyToolBody {
     params: serde_json::Value,
     #[serde(default)]
     step_id: Option<String>,
-    #[serde(default = "default_wait_for_ack")]
+    #[serde(default)]
     wait_for: Option<String>,
     #[serde(default)]
     ack_timeout_ms: Option<u64>,
@@ -823,7 +820,7 @@ async fn post_apply_tool(
         format!("apply_tool: {} params={}", body.tool, body.params),
     );
 
-    let wait_for_ack = body.wait_for.as_deref() == Some("ack");
+    let wait_for_ack = body.wait_for.as_deref().unwrap_or("ack") == "ack";
     let ack_timeout = Duration::from_millis(body.ack_timeout_ms.unwrap_or(3000));
     let step_id = body
         .step_id
