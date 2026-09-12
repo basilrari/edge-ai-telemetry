@@ -62,10 +62,10 @@ impl TelemetrySnapshot {
             _ => None,
         };
         Self {
-            ok: t.lat.is_some() && t.lon.is_some(),
+            ok: t.link_live(),
             link: link.clone(),
-            lat_deg: t.lat,
-            lon_deg: t.lon,
+            lat_deg: t.live_lat_lon().map(|p| p.0),
+            lon_deg: t.live_lat_lon().map(|p| p.1),
             alt_amsl_m: t.alt_amsl_m,
             alt_rel_m: t.relative_alt_m,
             groundspeed_m_s: t.groundspeed_m_s,
@@ -122,8 +122,12 @@ impl TelemetryHub {
         }
         *gate = Instant::now();
         drop(gate);
-        let snap = TelemetrySnapshot::from_cache(link, telem);
-        let _ = self.tx.send(snap);
+        self.publish(link, telem);
+    }
+
+    /// Always publish (link-down). Skips the 10 Hz gate so subscribers do not keep the last live pin.
+    pub fn publish(&self, link: &LinkInfo, telem: &TelemetryCache) {
+        let _ = self.tx.send(TelemetrySnapshot::from_cache(link, telem));
     }
 
     pub fn snapshot_now(&self, link: &LinkInfo, telem: &TelemetryCache) -> TelemetrySnapshot {

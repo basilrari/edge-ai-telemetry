@@ -1,6 +1,6 @@
 //! HTTP control plane for the `drone_server` library: accepts gateway tool names and sends MAVLink.
 //!
-//! Run on the Jetson beside the gateway (default listen `0.0.0.0:3001`). MAVLink args match `tui` / `raw`
+//! Run on the Jetson beside the gateway (default listen `127.0.0.1:3001`). MAVLink args match `tui` / `raw`
 //! (`--serial`, `--baud`, or default UDP `udpin:0.0.0.0:14550`).
 //!
 //! ```text
@@ -41,7 +41,7 @@ use tracing::{error, info, info_span, warn};
 #[command(name = "drone-http")]
 struct Args {
     /// HTTP bind address (gateway should use `http://127.0.0.1:<port>` when co-located).
-    #[arg(long, default_value = "0.0.0.0:3001")]
+    #[arg(long, default_value = "127.0.0.1:3001")]
     listen: SocketAddr,
     /// MAVLink connection args (same as `tui`): e.g. `--serial` or `--serial /dev/ttyACM0 --baud 921600`.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -132,9 +132,21 @@ fn spawn_mavlink_connector(
                         completion_hub.clone(),
                     );
                     if let Ok(mut slot) = recv_join.lock() {
-                        *slot = Some(join);
+                        *slot = None;
                     }
-                    return;
+                    let _ = join.join();
+                    if let Ok(mut slot) = conn_slot.lock() {
+                        *slot = None;
+                    }
+                    if let Ok(mut slot) = telem.lock() {
+                        *slot = TelemetryCache::default();
+                    }
+                    if let Ok(mut slot) = link_slot.lock() {
+                        *slot = disconnected_link();
+                    }
+                    telemetry_hub.publish(&disconnected_link(), &TelemetryCache::default());
+                    warn!("MAVLink recv ended; reconnecting");
+                    thread::sleep(Duration::from_secs(1));
                 }
                 Err(e) => {
                     warn!(error = %e, "MAVLink unavailable; retrying in 5s");
@@ -277,6 +289,36 @@ fn request_id_from_headers(h: &HeaderMap) -> String {
         .unwrap_or_else(|| format!("drone-http-{}", std::process::id()))
 }
 
+fn extract_api_key(headers: &HeaderMap) -> Option<String> {
+    if let Some(v) = headers.get(axum::http::header::AUTHORIZATION) {
+        if let Ok(s) = v.to_str() {
+            if let Some(token) = s.strip_prefix("Bearer ") {
+                return Some(token.trim().to_string());
+            }
+        }
+    }
+    headers
+        .get("x-api-key")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_string())
+}
+
+fn mcp_key_reject(headers: &HeaderMap) -> Option<(StatusCode, String)> {
+    let expected = match std::env::var("MCP_API_KEY") {
+        Ok(k) if !k.is_empty() => k,
+        _ => {
+            return Some((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "mcp_public_disabled".to_string(),
+            ));
+        }
+    };
+    if extract_api_key(headers).as_deref() != Some(expected.as_str()) {
+        return Some((StatusCode::UNAUTHORIZED, "unauthorized".to_string()));
+    }
+    None
+}
+
 #[derive(Serialize)]
 struct PositionResponse {
     ok: bool,
@@ -303,7 +345,7 @@ async fn get_position(State(state): State<Arc<AppState>>) -> Json<PositionRespon
             });
         }
     };
-    if let (Some(lat), Some(lon)) = (t.lat, t.lon) {
+    if let Some((lat, lon)) = t.live_lat_lon() {
         Json(PositionResponse {
             ok: true,
             lat_deg: Some(lat),
@@ -317,7 +359,7 @@ async fn get_position(State(state): State<Arc<AppState>>) -> Json<PositionRespon
             lat_deg: None,
             lon_deg: None,
             alt_amsl_m: None,
-            error: Some("no_global_position_yet".into()),
+            error: Some("no_live_gps_fix".into()),
         })
     }
 }
@@ -374,11 +416,12 @@ async fn get_telemetry(State(state): State<Arc<AppState>>) -> Json<TelemetryResp
         (Some(v), Some(a)) if v.is_finite() && a.is_finite() => Some(v * a),
         _ => None,
     };
+    let live = t.live_lat_lon();
     Json(TelemetryResponse {
-        ok: t.lat.is_some() && t.lon.is_some(),
+        ok: t.link_live(),
         link: read_link(&state),
-        lat_deg: t.lat,
-        lon_deg: t.lon,
+        lat_deg: live.map(|p| p.0),
+        lon_deg: live.map(|p| p.1),
         alt_amsl_m: t.alt_amsl_m,
         alt_rel_m: t.relative_alt_m,
         groundspeed_m_s: t.groundspeed_m_s,
@@ -741,6 +784,24 @@ async fn post_apply_tool(
     headers: HeaderMap,
     Json(body): Json<ApplyToolBody>,
 ) -> (StatusCode, Json<ApplyToolResponse>) {
+    if let Some((status, err)) = mcp_key_reject(&headers) {
+        return (
+            status,
+            Json(ApplyToolResponse {
+                ok: false,
+                tool: body.tool,
+                error: Some(err),
+                target_system: 0,
+                target_component: 0,
+                step_id: None,
+                request_id: None,
+                dispatch_ms: None,
+                ack_wait_ms: None,
+                completion_status: None,
+                ack_result: None,
+            }),
+        );
+    }
     let rid = request_id_from_headers(&headers);
     let span = info_span!(
         "drone_http_apply",
@@ -759,7 +820,7 @@ async fn post_apply_tool(
         format!("apply_tool: {} params={}", body.tool, body.params),
     );
 
-    let wait_for_ack = body.wait_for.as_deref() == Some("ack");
+    let wait_for_ack = body.wait_for.as_deref().unwrap_or("ack") == "ack";
     let ack_timeout = Duration::from_millis(body.ack_timeout_ms.unwrap_or(3000));
     let step_id = body
         .step_id
