@@ -345,7 +345,7 @@ async fn get_position(State(state): State<Arc<AppState>>) -> Json<PositionRespon
             });
         }
     };
-    if let (Some(lat), Some(lon)) = t.live_lat_lon() {
+    if let Some((lat, lon)) = t.live_lat_lon() {
         Json(PositionResponse {
             ok: true,
             lat_deg: Some(lat),
