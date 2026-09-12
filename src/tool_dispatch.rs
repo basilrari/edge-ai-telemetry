@@ -19,7 +19,7 @@ use crate::mavlink_http_runtime::{
 };
 use crate::{
     arm, disarm, force_arm, goto_global_command_int, land, mission_set_current, mission_start, rtl,
-    set_mode_auto, set_mode_guided, set_mode_guided_long, takeoff_alt, with_vehicle, VehicleIds,
+    set_mode_auto, set_mode_guided, takeoff_alt, with_vehicle, VehicleIds,
 };
 use std::time::Duration;
 use mavlink::ardupilotmega::{
@@ -158,7 +158,7 @@ where
         }
         "force_arm" => force_arm(conn, ids).map_err(|e| e.to_string()),
         "set_mode_auto" => set_mode_auto(conn, ids).map_err(|e| e.to_string()),
-        "set_mode_guided" => set_mode_guided_long(conn, ids).map_err(|e| e.to_string()),
+        "set_mode_guided" => set_mode_guided(conn, ids).map_err(|e| e.to_string()),
         "loiter" | "hover" => set_arducopter_mode_long(conn, ids, ARDUCOPTER_MODE_LOITER)
             .map_err(|e| e.to_string()),
         "takeoff" => {

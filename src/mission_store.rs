@@ -120,11 +120,6 @@ impl MissionStore {
         self.snapshot_for_override()
     }
 
-    /// Clear snapshot after resume. Not used when we want multiple interrupts (snapshot is kept and seq updated).
-    pub fn clear_snapshot(&mut self) {
-        self.snapshot = None;
-    }
-
     /// Start upload: set pending items. Caller must then send MISSION_COUNT(count).
     pub fn set_upload_pending(&mut self, items: Vec<StoredMissionItem>) {
         self.upload_done = false;
@@ -141,7 +136,7 @@ impl MissionStore {
     }
 
     /// True once every pending item seq has been sent at least once (ArduPilot pull protocol).
-    pub fn all_upload_items_sent(&self) -> bool {
+    pub fn upload_ready_for_ack(&self) -> bool {
         let Some(items) = &self.upload_pending else {
             return false;
         };
@@ -149,10 +144,6 @@ impl MissionStore {
             && items
                 .iter()
                 .all(|it| self.upload_sent_seqs.contains(&it.seq))
-    }
-
-    pub fn upload_ready_for_ack(&self) -> bool {
-        self.all_upload_items_sent()
     }
 
     /// True while a planner upload or pre-upload clear is in progress (pause mission download).
