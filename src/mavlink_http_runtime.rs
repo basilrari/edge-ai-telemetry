@@ -2,6 +2,7 @@
 
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use crate::command_completion::CommandCompletionHub;
 use crate::logs_hub::LogsHub;
@@ -93,6 +94,7 @@ pub fn resolve_takeoff_altitude_m(
 mod altitude_tests {
     use super::*;
     use serde_json::json;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn zero_or_missing_uses_default() {
@@ -120,6 +122,36 @@ mod altitude_tests {
     fn sys_status_voltage_millivolts_to_volts() {
         assert_eq!(sys_status_voltage_v(12_600), Some(12.6));
         assert_eq!(sys_status_voltage_v(u16::MAX), None);
+    }
+
+    #[test]
+    fn gps_3d_plus_not_2d() {
+        assert!(gps_fix_is_3d_plus("3D"));
+        assert!(gps_fix_is_3d_plus("DGPS"));
+        assert!(gps_fix_is_3d_plus("RTK_FIX"));
+        assert!(!gps_fix_is_3d_plus("2D"));
+        assert!(!gps_fix_is_3d_plus("NO_FIX"));
+        assert!(!gps_fix_is_3d_plus("NO_GPS"));
+    }
+
+    #[test]
+    fn live_lat_lon_requires_fresh_3d() {
+        let mut t = TelemetryCache::default();
+        assert!(t.live_lat_lon().is_none());
+        assert!(!t.link_live());
+        t.lat = Some(23.5);
+        t.lon = Some(120.4);
+        t.gps_fix = Some("3D".into());
+        t.last_frame_at = Some(Instant::now());
+        t.last_position_at = Some(Instant::now());
+        assert_eq!(t.live_lat_lon(), Some((23.5, 120.4)));
+        t.gps_fix = Some("2D".into());
+        assert!(t.live_lat_lon().is_none());
+        t.gps_fix = Some("3D".into());
+        t.last_frame_at = Some(Instant::now() - Duration::from_secs(10));
+        t.last_position_at = Some(Instant::now() - Duration::from_secs(10));
+        assert!(t.live_lat_lon().is_none());
+        assert!(!t.link_live());
     }
 }
 
@@ -187,6 +219,41 @@ pub struct TelemetryCache {
     pub gps_fix: Option<String>,
     pub gps_sats: Option<u8>,
     pub gps_hdop: Option<f32>,
+    last_frame_at: Option<Instant>,
+    last_position_at: Option<Instant>,
+}
+
+pub const TELEM_STALE: Duration = Duration::from_secs(3);
+
+pub fn gps_fix_is_3d_plus(fix: &str) -> bool {
+    matches!(
+        fix,
+        "3D" | "DGPS" | "RTK_FLT" | "RTK_FIX" | "STATIC" | "PPP"
+    )
+}
+
+impl TelemetryCache {
+    pub fn link_live(&self) -> bool {
+        self.last_frame_at
+            .map(|t| t.elapsed() <= TELEM_STALE)
+            .unwrap_or(false)
+    }
+
+    /// Lat/lon only from a fresh 3D+ fix. None if link down, stale, or no real fix.
+    pub fn live_lat_lon(&self) -> Option<(f64, f64)> {
+        if !self.link_live() {
+            return None;
+        }
+        let fix = self.gps_fix.as_deref()?;
+        if !gps_fix_is_3d_plus(fix) {
+            return None;
+        }
+        let at = self.last_position_at?;
+        if at.elapsed() > TELEM_STALE {
+            return None;
+        }
+        Some((self.lat?, self.lon?))
+    }
 }
 
 fn gps_fix_short(f: GpsFixType) -> &'static str {
@@ -223,6 +290,7 @@ fn telem_update_from_frame(cache: &mut TelemetryCache, frame: &MavFrame<MavMessa
             cache.lon = Some(d.lon as f64 / 1e7);
             cache.alt_amsl_m = Some(d.alt as f64 / 1000.0);
             cache.relative_alt_m = Some(d.relative_alt as f64 / 1000.0);
+            cache.last_position_at = Some(Instant::now());
         }
         MavMessage::VFR_HUD(d) => {
             cache.airspeed_m_s = Some(d.airspeed);
@@ -255,6 +323,7 @@ fn telem_update_from_frame(cache: &mut TelemetryCache, frame: &MavFrame<MavMessa
         }
         _ => {}
     }
+    cache.last_frame_at = Some(Instant::now());
 }
 
 pub fn spawn_http_mavlink_recv_thread<C>(
@@ -276,12 +345,29 @@ where
         let mut mission_count: Option<u16> = None;
         let mut vehicle_ids = VehicleIds::default();
 
+        let mut last_ok = Instant::now();
         loop {
             // Do not wrap the connection in an outer Mutex: serial MAVLink uses separate
             // read/write locks internally; holding one mutex across `recv_frame()` blocks HTTP apply-tool.
-            let frame = match recv_conn.recv_frame() {
-                Ok(f) => f,
-                Err(_) => continue,
+            let frame = match recv_conn.try_recv() {
+                Ok((header, msg)) => {
+                    last_ok = Instant::now();
+                    MavFrame {
+                        header,
+                        msg,
+                        protocol_version: mavlink::MavlinkVersion::V2,
+                    }
+                }
+                Err(_) => {
+                    if last_ok.elapsed() > TELEM_STALE {
+                        if let Ok(mut t) = recv_telem.lock() {
+                            *t = TelemetryCache::default();
+                        }
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(20));
+                    continue;
+                }
             };
 
             if let Ok(mut t) = recv_telem.lock() {
