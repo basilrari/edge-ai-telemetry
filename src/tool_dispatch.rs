@@ -4,11 +4,11 @@
 //! - **`arm`**: sends **arm** only (current flight mode unchanged). Use **`set_mode_guided`** / **`takeoff`** separately when needed.
 //! - **`takeoff`**: optional `{"altitude_m": <m>}` (meters above home). `0` or omitted with no usable telemetry → **15 m**; omit with telemetry to use **current**
 //!   altitude above home from telemetry (`GLOBAL_POSITION_INT`). **`MAV_CMD_NAV_TAKEOFF` only** — use after **`arm`**.
-//! - **`mission_set_current`**: `{"seq": 0}` (required) — sets **current mission item index** on the FC (`DO_SET_MISSION_CURRENT`); does not upload a mission or replace **`start_mission`** for “fly the mission”.
+//! - **`set_current_waypoint`**: `{"seq": 0}` (required) — sets **current mission item index** on the FC (`DO_SET_MISSION_CURRENT`); does not upload a mission or replace **`start_mission`** for “fly the mission”.
 //! - **`goto_location`**: `{"lat_deg":..,"lon_deg":..,"alt_m":..}` — `alt_m` is **relative to home**
 //!   (same convention as TUI interrupt / `COMMAND_INT` DO_REPOSITION). Omitted or `<= 0` → **15 m**. **No** automatic takeoff; the LLM should emit **`arm`**, **`takeoff`**, then **`goto_location`** when starting from the ground.
-//! - **`mission_interrupt`**: pause AUTO mission and hold (TUI `i`); needs GPS + home + recv thread.
-//! - **`mission_resume`**: continue the **existing FC mission** after interrupt (AUTO + MISSION_START); **no upload**.
+//! - **`pause`**: pause AUTO mission and hold (TUI `i`); needs GPS + home + recv thread.
+//! - **`resume`**: continue the **existing FC mission** after pause (AUTO + MISSION_START); **no upload**.
 //! - **`waypoint_inject`**: guided goto; `{"lat_deg","lon_deg","alt_m"}` or `{"waypoint_text":"…"}` (TUI `w`). **No** automatic takeoff.
 //! - **`move_forward`**: optional `{"speed_m_s": 3}` forward body-frame velocity.
 
@@ -38,17 +38,17 @@ pub const LLM_DRONE_TOOL_NAMES: &[&str] = &[
     "set_mode_guided",
     "takeoff",
     "start_mission",
-    "mission_set_current",
+    "set_current_waypoint",
     "goto_location",
     "move_forward",
     "loiter",
     "hover",
     "return_to_home",
-    "land_immediately",
+    "land",
     "circle_search",
     "retry_streams",
-    "mission_interrupt",
-    "mission_resume",
+    "pause",
+    "resume",
     "waypoint_inject",
 ];
 
@@ -178,15 +178,15 @@ where
                 .map_err(|e| e.to_string())
                 .and_then(|_| mission_start(conn, ids).map_err(|e| e.to_string()))
         }
-        "mission_set_current" => {
+        "set_current_waypoint" => {
             let seq = params
                 .get("seq")
                 .and_then(|v| v.as_u64())
                 .ok_or_else(|| {
-                    "mission_set_current requires params.seq (u64), e.g. {\"seq\":0}".to_string()
+                    "set_current_waypoint requires params.seq (u64), e.g. {\"seq\":0}".to_string()
                 })?;
             if seq > u16::MAX as u64 {
-                return Err("mission_set_current: seq out of range".into());
+                return Err("set_current_waypoint: seq out of range".into());
             }
             mission_set_current(conn, ids, seq as u16).map_err(|e| e.to_string())
         }
@@ -204,7 +204,7 @@ where
             conn.send_default(&msg).map(|_| ()).map_err(|e| e.to_string())
         }
         "return_to_home" => rtl(conn, ids).map_err(|e| e.to_string()),
-        "land_immediately" => land(conn, ids).map_err(|e| e.to_string()),
+        "land" => land(conn, ids).map_err(|e| e.to_string()),
         "move_forward" => {
             let vx = f32_param(&params, "speed_m_s", 3.0);
             set_mode_guided(conn, ids)
@@ -277,13 +277,13 @@ pub fn expected_ack_command(tool: &str) -> Option<MavCmd> {
     match tool {
         "arm" | "disarm" | "force_arm" => Some(MavCmd::MAV_CMD_COMPONENT_ARM_DISARM),
         "takeoff" => Some(MavCmd::MAV_CMD_NAV_TAKEOFF),
-        "land_immediately" => Some(MavCmd::MAV_CMD_NAV_LAND),
+        "land" => Some(MavCmd::MAV_CMD_NAV_LAND),
         "return_to_home" => Some(MavCmd::MAV_CMD_NAV_RETURN_TO_LAUNCH),
         "goto_location" | "waypoint_inject" => Some(MavCmd::MAV_CMD_DO_REPOSITION),
         "set_mode_auto" | "set_mode_guided" | "loiter" | "hover" | "circle_search" => {
             Some(MavCmd::MAV_CMD_DO_SET_MODE)
         }
-        "mission_set_current" => Some(MavCmd::MAV_CMD_DO_SET_MISSION_CURRENT),
+        "set_current_waypoint" => Some(MavCmd::MAV_CMD_DO_SET_MISSION_CURRENT),
         "start_mission" => Some(MavCmd::MAV_CMD_MISSION_START),
         "move_forward" | "retry_streams" => None,
         _ => None,
