@@ -18,8 +18,8 @@ use serde_json::Value;
 
 const ARDUCOPTER_CUSTOM_AUTO: u32 = 3;
 
-/// Mission interrupt (TUI `i`): snapshot mission, GUIDED + DO_REPOSITION at current position (alt relative to home).
-pub fn mission_interrupt<C: MavConnection<MavMessage>>(
+/// Pause mission (TUI `i`): snapshot mission, GUIDED + DO_REPOSITION at current position (alt relative to home).
+pub fn pause<C: MavConnection<MavMessage>>(
     conn: &C,
     ids: VehicleIds,
     mission: &Arc<Mutex<MissionStore>>,
@@ -32,7 +32,7 @@ pub fn mission_interrupt<C: MavConnection<MavMessage>>(
         .heartbeat_custom_mode;
     if custom != Some(ARDUCOPTER_CUSTOM_AUTO) {
         return Err(
-            "mission_interrupt: need AUTO mode (custom_mode=3) and mission running; use start_mission first"
+            "pause: need AUTO mode (custom_mode=3) and mission running; use start_mission first"
                 .into(),
         );
     }
@@ -42,10 +42,10 @@ pub fn mission_interrupt<C: MavConnection<MavMessage>>(
         match (t.lat, t.lon, t.alt_amsl_m, t.home_alt_m) {
             (Some(la), Some(lo), Some(al), Some(home_al)) => (la, lo, al - home_al),
             (Some(_), Some(_), None, _) | (None, _, _, _) | (_, None, _, _) => {
-                return Err("mission_interrupt: need GPS position (GLOBAL_POSITION_INT)".into());
+                return Err("pause: need GPS position (GLOBAL_POSITION_INT)".into());
             }
             (_, _, Some(_), None) => {
-                return Err("mission_interrupt: need HOME_POSITION for relative altitude".into());
+                return Err("pause: need HOME_POSITION for relative altitude".into());
             }
         }
     };
@@ -53,12 +53,12 @@ pub fn mission_interrupt<C: MavConnection<MavMessage>>(
     {
         let mut os = override_state.lock().map_err(|e| format!("override_lock:{e}"))?;
         if matches!(&*os, HttpOverrideState::OverrideActive { .. }) {
-            return Err("mission_interrupt: finish waypoint_inject override first".into());
+            return Err("pause: finish waypoint_inject override first".into());
         }
         let mut store = mission.lock().map_err(|e| format!("mission_lock:{e}"))?;
         if !store.ensure_snapshot_for_pause() {
             return Err(
-                "mission_interrupt: no mission snapshot (wait for mission download on link)".into(),
+                "pause: no mission snapshot (wait for mission download on link)".into(),
             );
         }
         *os = HttpOverrideState::Paused;
@@ -70,9 +70,9 @@ pub fn mission_interrupt<C: MavConnection<MavMessage>>(
     Ok(())
 }
 
-/// Resume mission after interrupt: AUTO + current item + MISSION_START on the **existing FC mission**
+/// Resume mission after pause: AUTO + current item + MISSION_START on the **existing FC mission**
 /// (no mission upload — waypoints change only via Mission Planner HTTP upload/clear).
-pub fn mission_resume<C: MavConnection<MavMessage>>(
+pub fn resume<C: MavConnection<MavMessage>>(
     conn: &C,
     ids: VehicleIds,
     mission: &Arc<Mutex<MissionStore>>,
@@ -87,11 +87,11 @@ pub fn mission_resume<C: MavConnection<MavMessage>>(
                 if !matches!(*os, HttpOverrideState::MissionRunning) {
                     *os = HttpOverrideState::MissionRunning;
                     return Err(
-                        "mission_resume: no snapshot; override state reset (same as TUI c)"
+                        "resume: no snapshot; override state reset (same as TUI c)"
                             .into(),
                     );
                 }
-                return Err("mission_resume: no snapshot (nothing to resume)".into());
+                return Err("resume: no snapshot (nothing to resume)".into());
             }
         }
     };

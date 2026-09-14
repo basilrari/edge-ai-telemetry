@@ -852,14 +852,14 @@ async fn post_apply_tool(
                 .map(|g| *g)
                 .map_err(|e| format!("vehicle_ids_lock:{e}"))?;
             match tool_for_blocking.as_str() {
-                "mission_interrupt" => http_mission_tools::mission_interrupt(
+                "pause" => http_mission_tools::pause(
                     conn.as_ref(),
                     ids,
                     &st.mission,
                     &st.override_state,
                     &st.telem,
                 ),
-                "mission_resume" => http_mission_tools::mission_resume(
+                "resume" => http_mission_tools::resume(
                     conn.as_ref(),
                     ids,
                     &st.mission,
