@@ -5,6 +5,8 @@ use std::collections::HashSet;
 #[allow(deprecated)]
 use mavlink::ardupilotmega::{MavCmd, MISSION_ITEM_INT_DATA};
 
+use crate::mission_upload::TAKEOFF_INDEX;
+
 /// Stored mission item for re-upload (clone of MAVLink MISSION_ITEM_INT).
 pub type StoredMissionItem = MISSION_ITEM_INT_DATA;
 
@@ -73,12 +75,12 @@ impl MissionStore {
         }
     }
 
-    /// ArduPilot may report the takeoff slot as NAV_WAYPOINT at 0,0 — keep it as TAKEOFF for UI/tools.
+    /// ArduPilot may report a takeoff as a bare NAV_WAYPOINT at 0,0 — keep it as TAKEOFF for UI/tools.
     fn normalize_item_command(item: &mut MISSION_ITEM_INT_DATA) {
         if item.command == MavCmd::MAV_CMD_NAV_TAKEOFF {
             return;
         }
-        if item.seq == 0
+        if item.seq == TAKEOFF_INDEX
             && item.command == MavCmd::MAV_CMD_NAV_WAYPOINT
             && item.z > 0.0
             && item.x == 0
@@ -236,6 +238,7 @@ impl MissionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mission_upload::HOME_SLOT_INDEX;
     use mavlink::ardupilotmega::MavFrame;
 
     fn wp_item(seq: u16, command: MavCmd, x: i32, y: i32, z: f32) -> MISSION_ITEM_INT_DATA {
@@ -259,23 +262,30 @@ mod tests {
 
     #[test]
     fn normalize_zero_zero_waypoint_as_takeoff() {
-        let mut item = wp_item(0, MavCmd::MAV_CMD_NAV_WAYPOINT, 0, 0, 15.0);
+        let mut item = wp_item(TAKEOFF_INDEX, MavCmd::MAV_CMD_NAV_WAYPOINT, 0, 0, 15.0);
         MissionStore::normalize_item_command(&mut item);
         assert_eq!(item.command, MavCmd::MAV_CMD_NAV_TAKEOFF);
+    }
+
+    #[test]
+    fn home_slot_zero_zero_waypoint_is_not_a_takeoff() {
+        let mut item = wp_item(HOME_SLOT_INDEX, MavCmd::MAV_CMD_NAV_WAYPOINT, 0, 0, 15.0);
+        MissionStore::normalize_item_command(&mut item);
+        assert_eq!(item.command, MavCmd::MAV_CMD_NAV_WAYPOINT);
     }
 
     #[test]
     fn preserve_takeoff_when_fc_rewrites_command() {
         let mut store = MissionStore::new();
         store.update_from_item(&wp_item(
-            0,
+            TAKEOFF_INDEX,
             MavCmd::MAV_CMD_NAV_TAKEOFF,
             0,
             0,
             15.0,
         ));
         store.update_from_item(&wp_item(
-            0,
+            TAKEOFF_INDEX,
             MavCmd::MAV_CMD_NAV_WAYPOINT,
             23_558_000,
             120_473_000,

@@ -506,12 +506,20 @@ async fn post_mission_upload(
             .lock()
             .map(|g| *g)
             .map_err(|e| format!("vehicle_ids_lock:{e}"))?;
+        let home = {
+            let t = st.telem.lock().map_err(|e| format!("telem_lock:{e}"))?;
+            match (t.home_lat_deg, t.home_lon_deg) {
+                (Some(lat), Some(lon)) => Some((lat, lon)),
+                _ => None,
+            }
+        };
         mission_upload::mission_upload(
             conn.as_ref(),
             ids,
             &st.mission,
             &st.override_state,
             &body,
+            home,
         )
     })
     .await
@@ -786,8 +794,9 @@ fn ack_reject_hint(tool: &str, status: CompletionStatus, ack_result: Option<&str
         && status == CompletionStatus::Rejected
         && ack_result == Some("MAV_RESULT_FAILED")
     {
-        " (ArduCopter refused AUTO: the FC must be disarmed or already off the ground, and the loaded \
-          mission must start with a takeoff)"
+        " (ArduCopter refused AUTO: while armed and on the ground it requires the next mission \
+          command to be a takeoff, so the loaded mission needs its NAV_TAKEOFF at index 1 — the \
+          layout this server uploads — or the vehicle must already be off the ground)"
     } else {
         ""
     }

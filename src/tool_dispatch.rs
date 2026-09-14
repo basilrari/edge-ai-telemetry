@@ -5,6 +5,7 @@
 //! - **`takeoff`**: optional `{"altitude_m": <m>}` (meters above home). `0` or omitted with no usable telemetry → **15 m**; omit with telemetry to use **current**
 //!   altitude above home from telemetry (`GLOBAL_POSITION_INT`). **`MAV_CMD_NAV_TAKEOFF` only** — use after **`arm`**.
 //! - **`set_current_waypoint`**: `{"seq": 0}` (required) — sets **current mission item index** on the FC (`DO_SET_MISSION_CURRENT`); does not upload a mission or replace **`start_mission`** for “fly the mission”.
+//!   `seq` counts the waypoints the operator planned: `0` is the mission's first command (the takeoff), `1` the first planned waypoint. The handler adds one to reach the FC index, because index 0 belongs to the home slot ArduPilot reserves.
 //! - **`goto_location`**: `{"lat_deg":..,"lon_deg":..,"alt_m":..}` — `alt_m` is **relative to home**
 //!   (same convention as TUI interrupt / `COMMAND_INT` DO_REPOSITION). Omitted or `<= 0` → **15 m**. **No** automatic takeoff; the LLM should emit **`arm`**, **`takeoff`**, then **`goto_location`** when starting from the ground.
 //! - **`pause`**: pause AUTO mission and hold (TUI `i`); needs GPS + home + recv thread.
@@ -188,7 +189,10 @@ where
             if seq > u16::MAX as u64 {
                 return Err("set_current_waypoint: seq out of range".into());
             }
-            mission_set_current(conn, ids, seq as u16).map_err(|e| e.to_string())
+            // Operator waypoint numbers are shifted past the home slot ArduPilot reserves at index 0.
+            let fc_index =
+                crate::mission_upload::fc_index_for_operator_waypoint(seq as u16);
+            mission_set_current(conn, ids, fc_index).map_err(|e| e.to_string())
         }
         "goto_location" => {
             let lat = params
