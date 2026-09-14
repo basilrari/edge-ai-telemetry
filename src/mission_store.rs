@@ -217,17 +217,19 @@ impl MissionStore {
             .any(|it| it.command == MavCmd::MAV_CMD_NAV_TAKEOFF)
     }
 
-    /// Same checks as TUI **`m`** before AUTO + MISSION_START: mission downloaded and includes NAV_TAKEOFF.
-    pub fn validate_ready_for_start_mission(&self) -> Result<(), String> {
+    /// Checks before AUTO + MISSION_START. An AUTO mission is expected to start with a takeoff;
+    /// the one other state ArduCopter accepts is a vehicle that is already off the ground, which
+    /// then picks the mission up at its first waypoint. `airborne` carries that second state in.
+    pub fn validate_ready_for_start_mission(&self, airborne: bool) -> Result<(), String> {
         if self.items.is_empty() {
             return Err(
                 "start_mission: no mission on the link — upload a mission with takeoff from the Mission page first, then try again.".to_string(),
             );
         }
-        if !self.has_nav_takeoff() {
+        if !self.has_nav_takeoff() && !airborne {
             return Err(format!(
-                "start_mission: loaded mission has {} item(s) but no NAV_TAKEOFF (ArduCopter AUTO needs a TAKEOFF mission item first). \
-                 Upload a mission with takeoff from the Mission Planner — prompts cannot modify waypoints on the FC.",
+                "start_mission: loaded mission has {} item(s) but no NAV_TAKEOFF, and the vehicle is on the ground. \
+                 An AUTO mission needs a takeoff to leave the ground; upload one with takeoff from the Mission page.",
                 self.items.len()
             ));
         }

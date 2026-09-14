@@ -466,10 +466,11 @@ pub fn start_auto_mission<C: MavConnection<MavMessage>>(
     mission: &Arc<Mutex<MissionStore>>,
     telem: &Arc<Mutex<TelemetryCache>>,
 ) -> Result<(), String> {
+    let is_airborne = airborne(telem)?;
     let start_seq = {
         let store = mission.lock().map_err(|e| format!("mission_lock:{e}"))?;
-        store.validate_ready_for_start_mission()?;
-        start_seq_for(&store.items, airborne(telem)?)
+        store.validate_ready_for_start_mission(is_airborne)?;
+        start_seq_for(&store.items, is_airborne)
     };
 
     mission_set_current(conn, ids, start_seq).map_err(|e| e.to_string())?;

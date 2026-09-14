@@ -252,7 +252,7 @@ pub(crate) fn run_ui<C: MavConnection<MavMessage> + Send>(
                             }
                         }
                         if let Ok(store) = mission_store.lock() {
-                            if let Err(e) = store.validate_ready_for_start_mission() {
+                            if let Err(e) = store.validate_ready_for_start_mission(false) {
                                 state.push_recent(e);
                                 continue 'ui;
                             }

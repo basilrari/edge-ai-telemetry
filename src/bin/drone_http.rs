@@ -794,9 +794,9 @@ fn ack_reject_hint(tool: &str, status: CompletionStatus, ack_result: Option<&str
         && status == CompletionStatus::Rejected
         && ack_result == Some("MAV_RESULT_FAILED")
     {
-        " (ArduCopter refused AUTO: while armed and on the ground it requires the next mission \
-          command to be a takeoff, so the loaded mission needs its NAV_TAKEOFF at index 1 — the \
-          layout this server uploads — or the vehicle must already be off the ground)"
+        " (ArduCopter refused AUTO: an AUTO mission needs a takeoff, and the FC only looks for it at \
+          index 1 — re-upload the mission to get that layout. The other state it accepts is a vehicle \
+          already off the ground)"
     } else {
         ""
     }
