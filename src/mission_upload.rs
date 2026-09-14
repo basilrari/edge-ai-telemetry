@@ -94,24 +94,52 @@ pub fn infer_takeoff_alt_m(items: &[MISSION_ITEM_INT_DATA]) -> f32 {
         .clamp(MIN_TAKEOFF_ALT_M, MAX_TAKEOFF_ALT_M)
 }
 
-/// Insert NAV_TAKEOFF at seq 0 and renumber following items (no-op if already present).
+/// ArduPilot reserves mission index 0 for the home slot: `AP_Mission.h` defines
+/// `AP_MISSION_FIRST_REAL_COMMAND 1 // command #0 reserved to hold home position`, and
+/// `AP_Mission::starts_with_takeoff_cmd()` scans upwards from index 1 (or from the current nav
+/// index, which `set_current_cmd` never lets reach 0). A `NAV_TAKEOFF` at index 0 is therefore
+/// invisible to that check, so `ModeAuto::init()` refuses the AUTO switch for an armed, grounded
+/// vehicle and `MAV_CMD_MISSION_START` reports the refusal as a bare `MAV_RESULT_FAILED`.
+pub const HOME_SLOT_INDEX: u16 = 0;
+/// Index ArduPilot's `starts_with_takeoff_cmd()` looks at first on a mission that is not running.
+pub const TAKEOFF_INDEX: u16 = 1;
+
+/// Operator-facing waypoint numbers start counting above the home slot, so shift by one to keep
+/// `waypoint 0` meaning what it has always meant here: the start of the mission.
+pub fn fc_index_for_operator_waypoint(waypoint: u16) -> u16 {
+    waypoint.saturating_add(TAKEOFF_INDEX)
+}
+
+/// Insert the home slot plus NAV_TAKEOFF and renumber following items (no-op if a takeoff is present).
 pub fn prepend_nav_takeoff(
     items: Vec<MISSION_ITEM_INT_DATA>,
     ids: VehicleIds,
     takeoff_alt_m: f32,
+    home: Option<(f64, f64)>,
 ) -> Vec<MISSION_ITEM_INT_DATA> {
     if MissionStore::items_have_nav_takeoff(&items) {
         return items;
     }
     let alt = takeoff_alt_m.clamp(MIN_TAKEOFF_ALT_M, MAX_TAKEOFF_ALT_M);
-    let mut out = vec![mission_item_int(
-        ids,
-        0,
-        MavCmd::MAV_CMD_NAV_TAKEOFF,
-        0.0,
-        0.0,
-        alt,
-    )];
+    let (lat, lon) = home_slot_coords(home, &items);
+    let mut out = vec![
+        mission_item_int(
+            ids,
+            HOME_SLOT_INDEX,
+            MavCmd::MAV_CMD_NAV_WAYPOINT,
+            lat,
+            lon,
+            alt,
+        ),
+        mission_item_int(
+            ids,
+            TAKEOFF_INDEX,
+            MavCmd::MAV_CMD_NAV_TAKEOFF,
+            0.0,
+            0.0,
+            alt,
+        ),
+    ];
     for mut item in items {
         item.seq = out.len() as u16;
         out.push(item);
@@ -119,9 +147,33 @@ pub fn prepend_nav_takeoff(
     out
 }
 
+/// Coordinates for the reserved home slot. Home is the right answer and keeps the slot a no-op if
+/// ArduPilot ever executes it. Without a home fix, fall back to the first planned waypoint rather
+/// than (0,0), which would be a fly-away if the slot is executed.
+fn home_slot_coords(
+    home: Option<(f64, f64)>,
+    items: &[MISSION_ITEM_INT_DATA],
+) -> (f64, f64) {
+    valid_home(home)
+        .or_else(|| {
+            items
+                .iter()
+                .find(|it| it.command == MavCmd::MAV_CMD_NAV_WAYPOINT)
+                .map(|it| (it.x as f64 / 1e7, it.y as f64 / 1e7))
+        })
+        .unwrap_or((0.0, 0.0))
+}
+
+fn valid_home(home: Option<(f64, f64)>) -> Option<(f64, f64)> {
+    home.filter(|(lat, lon)| {
+        lat.is_finite() && lon.is_finite() && (lat.abs() > 1e-6 || lon.abs() > 1e-6)
+    })
+}
+
 pub fn build_mission_items(
     ids: VehicleIds,
     req: &MissionUploadRequest,
+    home: Option<(f64, f64)>,
 ) -> Result<Vec<MISSION_ITEM_INT_DATA>, String> {
     if req.waypoints.is_empty() {
         return Err("mission upload: at least one waypoint is required".into());
@@ -148,15 +200,27 @@ pub fn build_mission_items(
     let mut seq: u16 = 0;
 
     if req.include_takeoff {
+        let (lat, lon) = valid_home(home).unwrap_or((
+            req.waypoints[0].lat_deg,
+            req.waypoints[0].lon_deg,
+        ));
         items.push(mission_item_int(
             ids,
-            seq,
+            HOME_SLOT_INDEX,
+            MavCmd::MAV_CMD_NAV_WAYPOINT,
+            lat,
+            lon,
+            takeoff_alt,
+        ));
+        items.push(mission_item_int(
+            ids,
+            TAKEOFF_INDEX,
             MavCmd::MAV_CMD_NAV_TAKEOFF,
             0.0,
             0.0,
             takeoff_alt,
         ));
-        seq += 1;
+        seq = TAKEOFF_INDEX + 1;
     }
 
     for wp in &req.waypoints {
@@ -312,12 +376,14 @@ pub fn upload_mission_items<C: MavConnection<MavMessage>>(
     Err("mission upload: timed out waiting for MISSION_ACK from flight controller".into())
 }
 
-/// If the FC mission lacks NAV_TAKEOFF, prepend one and re-upload (Mission Planner / TUI `m` only — not LLM prompts).
+/// If the FC mission lacks NAV_TAKEOFF, prepend the home slot + takeoff and re-upload (Mission
+/// Planner / TUI `m` only — not LLM prompts).
 pub fn ensure_nav_takeoff_on_fc<C: MavConnection<MavMessage>>(
     conn: &C,
     ids: VehicleIds,
     mission: &Arc<Mutex<MissionStore>>,
     http_override: Option<&Arc<Mutex<HttpOverrideState>>>,
+    home: Option<(f64, f64)>,
 ) -> Result<bool, String> {
     let needs_fixup = {
         let store = mission.lock().map_err(|e| format!("mission_lock:{e}"))?;
@@ -330,7 +396,7 @@ pub fn ensure_nav_takeoff_on_fc<C: MavConnection<MavMessage>>(
     let items = {
         let store = mission.lock().map_err(|e| format!("mission_lock:{e}"))?;
         let alt = infer_takeoff_alt_m(&store.items);
-        prepend_nav_takeoff(store.items.clone(), ids, alt)
+        prepend_nav_takeoff(store.items.clone(), ids, alt, home)
     };
 
     upload_mission_items(conn, ids, mission, http_override, items)?;
@@ -343,8 +409,9 @@ pub fn mission_upload<C: MavConnection<MavMessage>>(
     mission: &Arc<Mutex<MissionStore>>,
     override_state: &Arc<Mutex<HttpOverrideState>>,
     req: &MissionUploadRequest,
+    home: Option<(f64, f64)>,
 ) -> Result<usize, String> {
-    let items = build_mission_items(ids, req)?;
+    let items = build_mission_items(ids, req, home)?;
     upload_mission_items(
         conn,
         ids,
@@ -397,34 +464,45 @@ pub fn start_auto_mission<C: MavConnection<MavMessage>>(
     conn: &C,
     ids: VehicleIds,
     mission: &Arc<Mutex<MissionStore>>,
-    telem: &TelemetryCache,
+    telem: &Arc<Mutex<TelemetryCache>>,
 ) -> Result<(), String> {
-    let airborne = telem
-        .relative_alt_m
-        .map(|a| a > AIRBORNE_MIN_M)
-        .unwrap_or(false);
-
-    {
+    let is_airborne = airborne(telem)?;
+    let start_seq = {
         let store = mission.lock().map_err(|e| format!("mission_lock:{e}"))?;
-        store.validate_ready_for_start_mission()?;
-    }
+        store.validate_ready_for_start_mission(is_airborne)?;
+        start_seq_for(&store.items, is_airborne)
+    };
 
-    if airborne {
-        let seq = {
-            let store = mission.lock().map_err(|e| format!("mission_lock:{e}"))?;
-            store
-                .items
-                .iter()
-                .find(|it| it.command == MavCmd::MAV_CMD_NAV_WAYPOINT)
-                .map(|it| it.seq)
-        };
-        if let Some(seq) = seq {
-            mission_set_current(conn, ids, seq).map_err(|e| e.to_string())?;
-        }
-    }
-
+    mission_set_current(conn, ids, start_seq).map_err(|e| e.to_string())?;
     set_mode_auto(conn, ids).map_err(|e| e.to_string())?;
     mission_start(conn, ids).map_err(|e| e.to_string())
+}
+
+fn airborne(telem: &Arc<Mutex<TelemetryCache>>) -> Result<bool, String> {
+    Ok(telem
+        .lock()
+        .map_err(|e| format!("telem_lock:{e}"))?
+        .relative_alt_m
+        .map(|a| a > AIRBORNE_MIN_M)
+        .unwrap_or(false))
+}
+
+/// Where AUTO picks the mission up. Already flying: resume at the first waypoint, so the mission's
+/// own takeoff does not run a second time. On the ground: start at the takeoff, which is also what
+/// keeps ArduCopter's `starts_with_takeoff_cmd()` exemption true for the AUTO switch.
+fn start_seq_for(items: &[MISSION_ITEM_INT_DATA], airborne: bool) -> u16 {
+    let wanted = if airborne {
+        MavCmd::MAV_CMD_NAV_WAYPOINT
+    } else {
+        MavCmd::MAV_CMD_NAV_TAKEOFF
+    };
+    items
+        .iter()
+        // Index 0 is the reserved home slot, which is also a waypoint; skip it.
+        .filter(|it| it.seq > HOME_SLOT_INDEX)
+        .find(|it| it.command == wanted)
+        .map(|it| it.seq)
+        .unwrap_or(TAKEOFF_INDEX)
 }
 
 #[cfg(test)]
@@ -441,18 +519,50 @@ mod tests {
     }
 
     #[test]
-    fn prepend_takeoff_renumbers_items() {
+    fn prepend_takeoff_adds_home_slot_and_renumbers_items() {
         let ids = VehicleIds::default();
         let wp = mission_item_int(ids, 0, MavCmd::MAV_CMD_NAV_WAYPOINT, 23.0, 120.0, 15.0);
         let rtl = mission_item_int(ids, 1, MavCmd::MAV_CMD_NAV_RETURN_TO_LAUNCH, 0.0, 0.0, 0.0);
-        let fixed = prepend_nav_takeoff(vec![wp, rtl], ids, 12.0);
-        assert_eq!(fixed.len(), 3);
-        assert_eq!(fixed[0].command, MavCmd::MAV_CMD_NAV_TAKEOFF);
-        assert_eq!(fixed[0].seq, 0);
-        assert_eq!(fixed[0].z, 12.0);
-        assert_eq!(fixed[1].command, MavCmd::MAV_CMD_NAV_WAYPOINT);
-        assert_eq!(fixed[1].seq, 1);
-        assert_eq!(fixed[2].command, MavCmd::MAV_CMD_NAV_RETURN_TO_LAUNCH);
+        let fixed = prepend_nav_takeoff(vec![wp, rtl], ids, 12.0, Some((-35.0, 149.0)));
+
+        assert_eq!(fixed.len(), 4);
+        assert_eq!(fixed[HOME_SLOT_INDEX as usize].command, MavCmd::MAV_CMD_NAV_WAYPOINT);
+        assert_eq!(fixed[HOME_SLOT_INDEX as usize].seq, HOME_SLOT_INDEX);
+        assert_eq!(fixed[HOME_SLOT_INDEX as usize].x, (-35.0f64 * 1e7).round() as i32);
+        assert_eq!(fixed[TAKEOFF_INDEX as usize].command, MavCmd::MAV_CMD_NAV_TAKEOFF);
+        assert_eq!(fixed[TAKEOFF_INDEX as usize].seq, TAKEOFF_INDEX);
+        assert_eq!(fixed[TAKEOFF_INDEX as usize].z, 12.0);
+        assert_eq!(fixed[2].command, MavCmd::MAV_CMD_NAV_WAYPOINT);
         assert_eq!(fixed[2].seq, 2);
+        assert_eq!(fixed[3].command, MavCmd::MAV_CMD_NAV_RETURN_TO_LAUNCH);
+        assert_eq!(fixed[3].seq, 3);
+    }
+
+    #[test]
+    fn home_slot_falls_back_to_first_waypoint_not_zero_zero() {
+        let ids = VehicleIds::default();
+        let wp = mission_item_int(ids, 0, MavCmd::MAV_CMD_NAV_WAYPOINT, 23.5, 120.5, 15.0);
+        let fixed = prepend_nav_takeoff(vec![wp], ids, 12.0, None);
+        assert_eq!(fixed[HOME_SLOT_INDEX as usize].command, MavCmd::MAV_CMD_NAV_WAYPOINT);
+        assert_eq!(fixed[HOME_SLOT_INDEX as usize].x, (23.5f64 * 1e7).round() as i32);
+        assert!(!(fixed[HOME_SLOT_INDEX as usize].x == 0 && fixed[HOME_SLOT_INDEX as usize].y == 0));
+    }
+
+    #[test]
+    fn start_seq_starts_at_takeoff_on_the_ground_and_at_the_first_waypoint_airborne() {
+        let ids = VehicleIds::default();
+        let items = vec![
+            mission_item_int(ids, 0, MavCmd::MAV_CMD_NAV_WAYPOINT, -35.0, 149.0, 15.0),
+            mission_item_int(ids, 1, MavCmd::MAV_CMD_NAV_TAKEOFF, 0.0, 0.0, 15.0),
+            mission_item_int(ids, 2, MavCmd::MAV_CMD_NAV_WAYPOINT, 23.56, 120.47, 15.0),
+        ];
+        assert_eq!(start_seq_for(&items, false), TAKEOFF_INDEX);
+        assert_eq!(start_seq_for(&items, true), 2);
+    }
+
+    #[test]
+    fn operator_waypoint_numbers_shift_past_the_home_slot() {
+        assert_eq!(fc_index_for_operator_waypoint(0), TAKEOFF_INDEX);
+        assert_eq!(fc_index_for_operator_waypoint(2), 3);
     }
 }

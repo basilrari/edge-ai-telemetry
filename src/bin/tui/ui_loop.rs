@@ -229,11 +229,16 @@ pub(crate) fn run_ui<C: MavConnection<MavMessage> + Send>(
                             }
                         }
                         if let Ok(c) = conn.lock() {
+                            let home = match (state.home_lat, state.home_lon) {
+                                (Some(lat), Some(lon)) => Some((lat, lon)),
+                                _ => None,
+                            };
                             match drone_server::mission_upload::ensure_nav_takeoff_on_fc(
                                 &*c,
                                 ids,
                                 &mission_store,
                                 None,
+                                home,
                             ) {
                                 Ok(true) => state.push_recent(
                                     "Inserted NAV_TAKEOFF at mission start and re-uploaded to FC."
@@ -247,7 +252,7 @@ pub(crate) fn run_ui<C: MavConnection<MavMessage> + Send>(
                             }
                         }
                         if let Ok(store) = mission_store.lock() {
-                            if let Err(e) = store.validate_ready_for_start_mission() {
+                            if let Err(e) = store.validate_ready_for_start_mission(false) {
                                 state.push_recent(e);
                                 continue 'ui;
                             }
