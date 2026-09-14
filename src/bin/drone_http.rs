@@ -779,6 +779,20 @@ struct ApplyBlockingOutcome {
     ack_result: Option<String>,
 }
 
+/// ArduCopter reports a refused AUTO switch as a bare `MAV_RESULT_FAILED`; name the usual cause so
+/// the caller sees something actionable instead of the raw MAVLink result.
+fn ack_reject_hint(tool: &str, status: CompletionStatus, ack_result: Option<&str>) -> &'static str {
+    if tool == "start_mission"
+        && status == CompletionStatus::Rejected
+        && ack_result == Some("MAV_RESULT_FAILED")
+    {
+        " (ArduCopter refused AUTO: the FC must be disarmed or already off the ground, and the loaded \
+          mission must start with a takeoff)"
+    } else {
+        ""
+    }
+}
+
 async fn post_apply_tool(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -881,12 +895,13 @@ async fn post_apply_tool(
                     None,
                 ),
                 "start_mission" => {
-                    let telem_guard = st.telem.lock().map_err(|e| format!("telem_lock:{e}"))?;
+                    // Waits for the AUTO gate internally, so pass the shared cache rather than a
+                    // snapshot: the wait re-locks per read while the recv thread keeps it fresh.
                     mission_upload::start_auto_mission(
                         conn.as_ref(),
                         ids,
                         &st.mission,
-                        &telem_guard,
+                        &st.telem,
                     )
                 }
                 _ => {
@@ -917,9 +932,14 @@ async fn post_apply_tool(
                             None
                         } else {
                             Some(format!(
-                                "ack_{}: {:?}",
+                                "ack_{}: {:?}{}",
                                 ack_out.status.as_str(),
-                                ack_out.ack_result
+                                ack_out.ack_result,
+                                ack_reject_hint(
+                                    &tool_for_blocking,
+                                    ack_out.status,
+                                    ack_out.ack_result.as_deref()
+                                )
                             ))
                         };
                         Ok(ApplyBlockingOutcome {

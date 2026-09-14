@@ -1,7 +1,7 @@
 //! Build ArduPilot mission items from planner JSON and upload via MAVLink handshake.
 
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::cmd::DEFAULT_TAKEOFF_ALTITUDE_M;
 use crate::{mission_set_current, mission_start, set_mode_auto, MissionStore, VehicleIds, send_gcs, GCS_COMPONENT_ID, GCS_SYSTEM_ID};
@@ -391,23 +391,36 @@ pub fn mission_clear<C: MavConnection<MavMessage>>(
 }
 
 const AIRBORNE_MIN_M: f64 = 2.5;
+/// Altitude at which ArduCopter has cleared `land_complete` after the takeoff ACK. Below it the
+/// vehicle counts as on the ground, which is what makes `ModeAuto::init()` refuse the AUTO switch.
+const AUTO_SWITCH_MIN_ALT_M: f64 = 1.0;
+/// `arm`'s COMMAND_ACK arrives before the next HEARTBEAT, so `armed` can still read `false` in the
+/// telemetry cache immediately after a successful arm. ArduPilot publishes HEARTBEAT at 1 Hz, so
+/// give one heartbeat time to land before trusting that flag.
+const ARM_STATE_SETTLE: Duration = Duration::from_secs(2);
+const AUTO_SWITCH_WAIT: Duration = Duration::from_secs(12);
+const AUTO_SWITCH_POLL: Duration = Duration::from_millis(200);
 
 /// AUTO + MISSION_START using the mission already on the FC (upload only via Mission Planner).
 pub fn start_auto_mission<C: MavConnection<MavMessage>>(
     conn: &C,
     ids: VehicleIds,
     mission: &Arc<Mutex<MissionStore>>,
-    telem: &TelemetryCache,
+    telem: &Arc<Mutex<TelemetryCache>>,
 ) -> Result<(), String> {
-    let airborne = telem
-        .relative_alt_m
-        .map(|a| a > AIRBORNE_MIN_M)
-        .unwrap_or(false);
-
     {
         let store = mission.lock().map_err(|e| format!("mission_lock:{e}"))?;
         store.validate_ready_for_start_mission()?;
     }
+
+    wait_for_auto_switch_allowed(telem)?;
+
+    let airborne = telem
+        .lock()
+        .map_err(|e| format!("telem_lock:{e}"))?
+        .relative_alt_m
+        .map(|a| a > AIRBORNE_MIN_M)
+        .unwrap_or(false);
 
     if airborne {
         let seq = {
@@ -425,6 +438,69 @@ pub fn start_auto_mission<C: MavConnection<MavMessage>>(
 
     set_mode_auto(conn, ids).map_err(|e| e.to_string())?;
     mission_start(conn, ids).map_err(|e| e.to_string())
+}
+
+/// ArduCopter's `ModeAuto::init()` refuses the AUTO switch while `motors->armed() && land_complete`,
+/// and `MAV_CMD_MISSION_START` reports that refusal as a bare `MAV_RESULT_FAILED`. An
+/// `arm` + `takeoff` + `start_mission` sequence hits that window because the takeoff ACK arrives
+/// long before the copter actually leaves the ground, so wait for the gate to clear before
+/// switching to AUTO. Locking per read (rather than holding the cache) keeps the MAVLink recv
+/// thread free to update it.
+fn wait_for_auto_switch_allowed(telem: &Arc<Mutex<TelemetryCache>>) -> Result<(), String> {
+    if !on_ground(read_armed_alt(telem)?.1) {
+        return Ok(());
+    }
+    // The arm/takeoff ACKs already arrived; let a HEARTBEAT land so `armed` is current.
+    std::thread::sleep(ARM_STATE_SETTLE);
+
+    let (armed, alt) = read_armed_alt(telem)?;
+    if !auto_switch_blocked(armed, alt) {
+        // Disarmed on the ground: ArduCopter accepts MISSION_START directly.
+        return Ok(());
+    }
+
+    // Armed and grounded, which is the `arm` + `takeoff` + `start_mission` window. Wait for the
+    // takeoff to actually leave the ground, the other way this gate clears.
+    let deadline = Instant::now() + AUTO_SWITCH_WAIT;
+    loop {
+        let (armed, alt) = read_armed_alt(telem)?;
+        if !on_ground(alt) {
+            return Ok(());
+        }
+        if armed != Some(true) {
+            // ArduPilot auto-disarms when a takeoff never happens (DISARM_DELAY), which clears the
+            // gate without the mission ever being able to fly. Report the failure instead of
+            // issuing a MISSION_START that would be accepted but do nothing.
+            return Err(
+                "start_mission: FC disarmed on the ground before the takeoff left the ground; \
+                 no mission was started."
+                    .to_string(),
+            );
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "start_mission: FC is armed and still on the ground after {}s, and ArduCopter refuses \
+                 AUTO in that state. Take off first (or disarm), then retry.",
+                AUTO_SWITCH_WAIT.as_secs()
+            ));
+        }
+        std::thread::sleep(AUTO_SWITCH_POLL);
+    }
+}
+
+fn read_armed_alt(telem: &Arc<Mutex<TelemetryCache>>) -> Result<(Option<bool>, Option<f64>), String> {
+    let t = telem.lock().map_err(|e| format!("telem_lock:{e}"))?;
+    Ok((t.armed, t.relative_alt_m))
+}
+
+fn on_ground(relative_alt_m: Option<f64>) -> bool {
+    relative_alt_m
+        .map(|a| a <= AUTO_SWITCH_MIN_ALT_M)
+        .unwrap_or(true)
+}
+
+fn auto_switch_blocked(armed: Option<bool>, relative_alt_m: Option<f64>) -> bool {
+    armed == Some(true) && on_ground(relative_alt_m)
 }
 
 #[cfg(test)]
@@ -454,5 +530,28 @@ mod tests {
         assert_eq!(fixed[1].seq, 1);
         assert_eq!(fixed[2].command, MavCmd::MAV_CMD_NAV_RETURN_TO_LAUNCH);
         assert_eq!(fixed[2].seq, 2);
+    }
+
+    #[test]
+    fn auto_switch_gate_only_blocks_armed_on_ground() {
+        assert!(auto_switch_blocked(Some(true), Some(0.0)));
+        assert!(auto_switch_blocked(Some(true), Some(0.9)));
+        // Armed but altitude unknown: stay blocked rather than fire a doomed MISSION_START.
+        assert!(auto_switch_blocked(Some(true), None));
+
+        // Disarmed is always allowed, on the ground or not.
+        assert!(!auto_switch_blocked(Some(false), Some(0.0)));
+        // Once the copter has left the ground ArduCopter stops refusing AUTO.
+        assert!(!auto_switch_blocked(Some(true), Some(1.1)));
+        // Unknown armed state is not treated as armed.
+        assert!(!auto_switch_blocked(None, Some(0.0)));
+    }
+
+    #[test]
+    fn on_ground_treats_unknown_altitude_as_grounded() {
+        assert!(on_ground(Some(0.0)));
+        assert!(on_ground(Some(1.0)));
+        assert!(on_ground(None));
+        assert!(!on_ground(Some(1.01)));
     }
 }
