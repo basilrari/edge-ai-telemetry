@@ -69,6 +69,10 @@ pub fn altitude_above_home_from_params(
     altitude_above_home_m(params.get(key).and_then(|v| v.as_f64()))
 }
 
+/// Lowest height a takeoff may aim for. A grounded vehicle reports a couple of centimetres of
+/// sensor noise, and ArduCopter rejects a `NAV_TAKEOFF` aimed at that instead of climbing.
+const MIN_TAKEOFF_ALT_M: f64 = 2.0;
+
 /// Resolve `NAV_TAKEOFF` target altitude (meters above home, same convention as `goto_location` `alt_m`).
 pub fn resolve_takeoff_altitude_m(
     params: &serde_json::Value,
@@ -77,11 +81,20 @@ pub fn resolve_takeoff_altitude_m(
     if params.get("altitude_m").is_some() {
         return Ok(altitude_above_home_from_params(params, "altitude_m"));
     }
+    // Only inherit the current altitude when it is a real height. On the ground it is noise
+    // around zero, and taking off to the noise is no takeoff at all — use the default instead.
     if let Some(rel) = telem.relative_alt_m {
+        if rel < MIN_TAKEOFF_ALT_M {
+            return Ok(DEFAULT_ALTITUDE_ABOVE_HOME_M);
+        }
         return Ok(altitude_above_home_m(Some(rel)));
     }
     if let (Some(alt), Some(home)) = (telem.alt_amsl_m, telem.home_alt_m) {
-        return Ok(altitude_above_home_m(Some((alt - home).max(0.0))));
+        let rel = alt - home;
+        if rel < MIN_TAKEOFF_ALT_M {
+            return Ok(DEFAULT_ALTITUDE_ABOVE_HOME_M);
+        }
+        return Ok(altitude_above_home_m(Some(rel)));
     }
     Err(
         "takeoff: no params.altitude_m and no position telemetry yet (GLOBAL_POSITION_INT); \
@@ -114,6 +127,31 @@ mod altitude_tests {
         let params = json!({ "altitude_m": 0 });
         assert_eq!(
             resolve_takeoff_altitude_m(&params, &telem).unwrap(),
+            DEFAULT_ALTITUDE_ABOVE_HOME_M
+        );
+    }
+
+    #[test]
+    fn takeoff_inherits_current_altitude_only_when_airborne() {
+        let mut telem = TelemetryCache::default();
+        telem.relative_alt_m = Some(0.03);
+        assert_eq!(
+            resolve_takeoff_altitude_m(&json!({}), &telem).unwrap(),
+            DEFAULT_ALTITUDE_ABOVE_HOME_M,
+            "ground noise must not become the takeoff target"
+        );
+        telem.relative_alt_m = Some(12.0);
+        assert_eq!(resolve_takeoff_altitude_m(&json!({}), &telem).unwrap(), 12.0);
+    }
+
+    #[test]
+    fn takeoff_ground_noise_via_amsl_defaults() {
+        let mut telem = TelemetryCache::default();
+        telem.relative_alt_m = None;
+        telem.alt_amsl_m = Some(587.01);
+        telem.home_alt_m = Some(587.0);
+        assert_eq!(
+            resolve_takeoff_altitude_m(&json!({}), &telem).unwrap(),
             DEFAULT_ALTITUDE_ABOVE_HOME_M
         );
     }
