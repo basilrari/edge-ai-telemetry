@@ -457,8 +457,6 @@ pub fn mission_clear<C: MavConnection<MavMessage>>(
     Ok(())
 }
 
-const AIRBORNE_MIN_M: f64 = 2.5;
-
 /// AUTO + MISSION_START using the mission already on the FC (upload only via Mission Planner).
 pub fn start_auto_mission<C: MavConnection<MavMessage>>(
     conn: &C,
@@ -483,7 +481,7 @@ fn airborne(telem: &Arc<Mutex<TelemetryCache>>) -> Result<bool, String> {
         .lock()
         .map_err(|e| format!("telem_lock:{e}"))?
         .relative_alt_m
-        .map(|a| a > AIRBORNE_MIN_M)
+        .map(|a| a > crate::flight_safety::AIRBORNE_ALT_M)
         .unwrap_or(false))
 }
 
