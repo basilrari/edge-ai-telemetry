@@ -12,7 +12,7 @@
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
@@ -24,8 +24,12 @@ use drone_server::logs_hub::LogsHub;
 use drone_server::http_mission_tools;
 use drone_server::mission_upload::{self, MissionUploadRequest};
 use drone_server::mavlink_connect::{self, LinkInfo};
+use drone_server::flight_safety::{
+    disarm_block_reason, wait_for_takeoff_altitude, TAKEOFF_COMPLETE_TIMEOUT,
+};
 use drone_server::mavlink_http_runtime::{
-    arducopter_mode_name, spawn_http_mavlink_recv_thread, HttpOverrideState, TelemetryCache,
+    altitude_above_home_from_params, arducopter_mode_name, spawn_http_mavlink_recv_thread,
+    HttpOverrideState, TelemetryCache,
 };
 use drone_server::telemetry_hub::TelemetryHub;
 use drone_server::tool_dispatch::{apply_llm_drone_tool, expected_ack_command, LLM_DRONE_TOOL_NAMES};
@@ -787,6 +791,42 @@ struct ApplyBlockingOutcome {
     ack_result: Option<String>,
 }
 
+/// After a takeoff ACK, hold the HTTP request until the climb is done so the gateway's next
+/// sequential task is not sent while the aircraft is still on the ground.
+fn hold_until_takeoff_complete(
+    tool: &str,
+    wait_for_ack: bool,
+    params: &serde_json::Value,
+    telem: &Arc<Mutex<TelemetryCache>>,
+    mut outcome: ApplyBlockingOutcome,
+) -> ApplyBlockingOutcome {
+    if tool != "takeoff" || !wait_for_ack || !outcome.mavlink_ok {
+        return outcome;
+    }
+    let target = if params.get("altitude_m").is_some() {
+        Some(altitude_above_home_from_params(params, "altitude_m"))
+    } else {
+        None
+    };
+    let t0 = Instant::now();
+    match wait_for_takeoff_altitude(telem, target, TAKEOFF_COMPLETE_TIMEOUT) {
+        Ok(_) => {
+            let extra = t0.elapsed().as_millis() as u64;
+            outcome.ack_wait_ms = Some(outcome.ack_wait_ms.unwrap_or(0) + extra);
+            outcome.completion_status = Some("takeoff_complete".into());
+            outcome
+        }
+        Err(e) => {
+            let extra = t0.elapsed().as_millis() as u64;
+            outcome.ack_wait_ms = Some(outcome.ack_wait_ms.unwrap_or(0) + extra);
+            outcome.mavlink_ok = false;
+            outcome.error = Some(e);
+            outcome.completion_status = Some("takeoff_incomplete".into());
+            outcome
+        }
+    }
+}
+
 /// ArduCopter reports a refused AUTO switch as a bare `MAV_RESULT_FAILED`; name the usual cause so
 /// the caller sees something actionable instead of the raw MAVLink result.
 fn ack_reject_hint(tool: &str, status: CompletionStatus, ack_result: Option<&str>) -> &'static str {
@@ -868,6 +908,12 @@ async fn post_apply_tool(
         }
 
         let send_result: Result<(), String> = (|| {
+            if tool_for_blocking == "disarm" {
+                let telem = st.telem.lock().map_err(|e| format!("telem_lock:{e}"))?;
+                if let Some(reason) = disarm_block_reason(&telem) {
+                    return Err(reason);
+                }
+            }
             let conn = require_conn(&st)?;
             let ids = st
                 .vehicle_ids
@@ -951,23 +997,35 @@ async fn post_apply_tool(
                                 )
                             ))
                         };
-                        Ok(ApplyBlockingOutcome {
-                            mavlink_ok: ok,
-                            error: err,
-                            dispatch_ms,
-                            ack_wait_ms: Some(ack_out.ack_wait_ms),
-                            completion_status: Some(ack_out.status.as_str().to_string()),
-                            ack_result: ack_out.ack_result,
-                        })
+                        Ok(hold_until_takeoff_complete(
+                            &tool_for_blocking,
+                            wait_for_ack_blocking,
+                            &params_for_blocking,
+                            &st.telem,
+                            ApplyBlockingOutcome {
+                                mavlink_ok: ok,
+                                error: err,
+                                dispatch_ms,
+                                ack_wait_ms: Some(ack_out.ack_wait_ms),
+                                completion_status: Some(ack_out.status.as_str().to_string()),
+                                ack_result: ack_out.ack_result,
+                            },
+                        ))
                     } else {
-                        Ok(ApplyBlockingOutcome {
-                            mavlink_ok: true,
-                            error: None,
-                            dispatch_ms,
-                            ack_wait_ms: Some(0),
-                            completion_status: Some(CompletionStatus::NotApplicable.as_str().to_string()),
-                            ack_result: None,
-                        })
+                        Ok(hold_until_takeoff_complete(
+                            &tool_for_blocking,
+                            wait_for_ack_blocking,
+                            &params_for_blocking,
+                            &st.telem,
+                            ApplyBlockingOutcome {
+                                mavlink_ok: true,
+                                error: None,
+                                dispatch_ms,
+                                ack_wait_ms: Some(0),
+                                completion_status: Some(CompletionStatus::NotApplicable.as_str().to_string()),
+                                ack_result: None,
+                            },
+                        ))
                     }
                 }
                 Err(e) => {

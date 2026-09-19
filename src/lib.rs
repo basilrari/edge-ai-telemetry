@@ -12,6 +12,7 @@ pub mod telemetry_hub;
 pub mod mavlink_connect;
 pub mod mission_upload;
 pub mod tool_dispatch;
+pub mod flight_safety;
 
 pub use geo::{horizontal_distance_m, parse_waypoint_input};
 pub use mavlink_streams::{heartbeat_from_autopilot, refresh_mavlink_streams, request_stream_rates};
